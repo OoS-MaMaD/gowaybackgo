@@ -25,10 +25,11 @@ func main() {
 	onlyQuery := flag.Bool("only-query", false, "Output only full query strings")
 	onlyQueryKeys := flag.Bool("only-query-keys", false, "Output only query parameter keys")
 	noQuery := flag.Bool("no-query", false, "Remove query strings from URLs")
-	excludeExt := flag.String("exclude-ext", defaultExclude, "Comma-separated list of extensions to exclude")
+	excludeExt := flag.String("exclude-ext", "", "Comma-separated list of extensions to exclude. If the flag is omitted entirely no extensions will be excluded.")
+	excludeDefaults := flag.Bool("exclude-defaults", false, "Use the default extension excludes (shorthand for -exclude-ext=) [excludes: js,css,png,jpg,jpeg,gif,svg,webp,ico,bmp,tif,tiff,woff,woff2,ttf,eot,mp4,mp3,wav,avi,mov,mkv,zip,rar,7z,pdf]")
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
 	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
-	pageWorkers := flag.Int("page-workers", 5, "Number of concurrent page fetchers (CDX pages)")
+	pageWorkers := flag.Int("page-workers", 20, "Number of concurrent page fetchers (CDX pages)")
 	timeout := flag.Int("timeout", 80, "HTTP timeout in seconds")
 	flag.Parse()
 
@@ -74,8 +75,32 @@ func main() {
 		}
 	}
 
+	// Determine effective excludes. Priority:
+	// 1) If -exclude-defaults is set -> use defaultExclude
+	// 2) Else if -exclude-ext omitted entirely -> no excludes
+	// 3) Else if -exclude-ext provided but empty (-exclude-ext=) -> use defaultExclude
+	// 4) Else use the provided -exclude-ext value
+	var effectiveExclude string
+	excludeProvided := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "exclude-ext" {
+			excludeProvided = true
+		}
+	})
+	if *excludeDefaults {
+		effectiveExclude = defaultExclude
+	} else if !excludeProvided {
+		effectiveExclude = ""
+	} else {
+		if *excludeExt == "" {
+			effectiveExclude = defaultExclude
+		} else {
+			effectiveExclude = *excludeExt
+		}
+	}
+
 	// Compile extension filters
-	extRegex, includeMode, err := CompileExtRegex(*includeExt, *excludeExt)
+	extRegex, includeMode, err := CompileExtRegex(*includeExt, effectiveExclude)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "❌ ERROR compiling extension regex:", err)
 		os.Exit(1)

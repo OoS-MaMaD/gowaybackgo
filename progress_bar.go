@@ -22,6 +22,7 @@ type PBar struct {
 	start       time.Time
 	status      string
 	statusColor string
+	last        int
 }
 
 func NewPBar(total int) *PBar {
@@ -64,13 +65,16 @@ func (p *PBar) Render(curr int) {
 	}
 	// old combined bar string removed; we build colored parts separately below
 
-	// Colorize bar: done part green, remaining part dim
+	// Colorize bar: done part green, remaining part light gray (more portable than dim)
 	green := "\033[32m"
-	dim := "\033[90m"
+	dim := "\033[37m"
 	reset := "\033[0m"
 	donePart := strings.Repeat(p.DoneStr, done)
 	remPart := strings.Repeat(p.OngoingStr, p.Width-done)
 	coloredBar := fmt.Sprintf("%s%s%s%s%s", green, donePart, reset, dim, remPart)
+
+	// clear the whole line first to avoid leftover characters on some terminals
+	fmt.Fprint(p.out, "\r\033[K")
 
 	// append status in brackets (trim if too long)
 	status := p.status
@@ -85,13 +89,16 @@ func (p *PBar) Render(curr int) {
 	percent := float64(curr) / float64(p.Total) * 100
 	if status != "" {
 		if p.statusColor != "" {
-			fmt.Fprintf(p.out, "\r[%s] %d/%d (%.1f%%) [%s%s%s]", coloredBar, curr, p.Total, percent, p.statusColor, status, reset)
+			fmt.Fprintf(p.out, "[%s] %d/%d (%.1f%%) [%s%s%s]", coloredBar, curr, p.Total, percent, p.statusColor, status, reset)
 		} else {
-			fmt.Fprintf(p.out, "\r[%s] %d/%d (%.1f%%) [%s]", coloredBar, curr, p.Total, percent, status)
+			fmt.Fprintf(p.out, "[%s] %d/%d (%.1f%%) [%s]", coloredBar, curr, p.Total, percent, status)
 		}
 	} else {
-		fmt.Fprintf(p.out, "\r[%s] %d/%d (%.1f%%)", coloredBar, curr, p.Total, percent)
+		fmt.Fprintf(p.out, "[%s] %d/%d (%.1f%%)", coloredBar, curr, p.Total, percent)
 	}
+
+	// remember last rendered value so Log can re-render with current progress
+	p.last = curr
 }
 
 // ClearLine erases the current progress line so other output can be printed.
@@ -122,9 +129,9 @@ func (p *PBar) Log(msg string, color string) {
 		}
 		return
 	}
-	// re-render to show updated status
+	// re-render to show updated status using last known progress value
 	// Note: Render locks internally so it's safe to call here
-	p.Render(0)
+	p.Render(p.last)
 }
 
 // Finish moves to the next line (call when done) and closes /dev/tty if we
