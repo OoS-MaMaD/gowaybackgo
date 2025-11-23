@@ -30,7 +30,8 @@ func main() {
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
 	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
 	extractPaths := flag.Bool("extract-paths", false, "If set, extract unique path segments from each output URL and print each segment on its own line.")
-	pageWorkers := flag.Int("page-workers", 20, "Number of concurrent page fetchers (CDX pages)")
+	subs := flag.Bool("subs", false, "Only print unique subdomains for the provided base URL (e.g. example.com -> a.example.com, b.example.com)")
+	pageWorkers := flag.Int("page-workers", 10, "Number of concurrent page fetchers (CDX pages)")
 	timeout := flag.Int("timeout", 80, "HTTP timeout in seconds")
 	flag.Parse()
 
@@ -43,7 +44,7 @@ func main() {
 	client := &http.Client{Timeout: time.Duration(*timeout) * time.Second}
 
 	// 1) Request number of pages
-	pagesURL := "http://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&showNumPages=true"
+	pagesURL := "http://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURLForCDX(*urlFlag, *subs)) + "&showNumPages=true"
 	resp, err := client.Get(pagesURL)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "❌ ERROR fetching page count from CDX:", err)
@@ -155,7 +156,7 @@ func main() {
 		go func() {
 			defer fetchWg.Done()
 			for p := range pageJobs {
-				pageURL := "https://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&page=" + strconv.Itoa(p) + "&fl=original&collapse=urlkey"
+				pageURL := "https://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURLForCDX(*urlFlag, *subs)) + "&page=" + strconv.Itoa(p) + "&fl=original&collapse=urlkey"
 				var respP *http.Response
 				var ierr error
 				for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -269,12 +270,66 @@ func main() {
 		}()
 	}
 
+	// Determine base domain for -subs if requested
+	var baseDomain string
+	if *subs {
+		// derive a simple base domain from the -u flag value: strip scheme and '*' chars
+		baseDomain = *urlFlag
+		baseDomain = strings.TrimSpace(baseDomain)
+		baseDomain = strings.TrimPrefix(baseDomain, "http://")
+		baseDomain = strings.TrimPrefix(baseDomain, "https://")
+		baseDomain = strings.ReplaceAll(baseDomain, "*", "")
+		if idx := strings.IndexAny(baseDomain, "/:\\"); idx >= 0 {
+			baseDomain = baseDomain[:idx]
+		}
+		baseDomain = strings.Trim(baseDomain, " .")
+	}
+
 	// Printer goroutine: dedupe and write immediately; keep progress bar at bottom
 	var printWg sync.WaitGroup
 	printWg.Add(1)
 	go func() {
 		defer printWg.Done()
 		bufw := bufio.NewWriter(outWriter)
+		// If user requested subdomain extraction, handle it here
+		if *subs {
+			if baseDomain == "" {
+				// nothing sensible to do
+				return
+			}
+			seenSubs := make(map[string]struct{})
+			baseLower := strings.ToLower(baseDomain)
+			for r := range resultsCh {
+				u, err := url.Parse(r)
+				if err != nil {
+					continue
+				}
+				host := u.Host
+				if idx := strings.Index(host, ":"); idx >= 0 {
+					host = host[:idx]
+				}
+				host = strings.ToLower(strings.TrimSpace(host))
+				if host == "" || host == baseLower {
+					continue
+				}
+				if strings.HasSuffix(host, "."+baseLower) {
+					if _, ok := seenSubs[host]; ok {
+						continue
+					}
+					seenSubs[host] = struct{}{}
+					pbar.ClearLine()
+					fmt.Fprintln(bufw, host)
+					bufw.Flush()
+					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+				}
+			}
+			if outFile != nil {
+				bufw.Flush()
+				outFile.Close()
+				fmt.Fprintln(os.Stdout, "✔ Saved results to", *outputFile)
+			}
+			return
+		}
 		if *extractPaths {
 			// Extract unique path segments from each URL
 			seenSeg := make(map[string]struct{})
@@ -354,6 +409,30 @@ func normalizeURL(u string) string {
 	u = strings.TrimPrefix(u, "https://")
 	if !strings.Contains(u, "*") {
 		u += "*"
+	}
+	return u
+}
+
+// normalizeURLForCDX prepares a URL pattern for CDX queries.
+// If subs==true we return a leading-wildcard base like "*.example.com" to get
+// subdomain captures. Otherwise we behave like normalizeURL (append a trailing
+// '*') unless the user already provided a wildcard.
+func normalizeURLForCDX(u string, subs bool) string {
+	s := strings.TrimSpace(u)
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "https://")
+	// remove any path or port
+	if idx := strings.IndexAny(s, "/:\\"); idx >= 0 {
+		s = s[:idx]
+	}
+	s = strings.ReplaceAll(s, "*", "")
+	s = strings.Trim(s, " .")
+	if subs {
+		// request leading wildcard for subdomain enumeration
+		return "*." + s
+	}
+	if !strings.Contains(u, "*") {
+		return s + "*"
 	}
 	return u
 }
