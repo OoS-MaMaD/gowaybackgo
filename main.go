@@ -29,6 +29,7 @@ func main() {
 	excludeDefaults := flag.Bool("exclude-defaults", false, "Use the default extension excludes (shorthand for -exclude-ext=) [excludes: js,css,png,jpg,jpeg,gif,svg,webp,ico,bmp,tif,tiff,woff,woff2,ttf,eot,mp4,mp3,wav,avi,mov,mkv,zip,rar,7z,pdf]")
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
 	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
+	extractPaths := flag.Bool("extract-paths", false, "If set, extract unique path segments from each output URL and print each segment on its own line.")
 	pageWorkers := flag.Int("page-workers", 20, "Number of concurrent page fetchers (CDX pages)")
 	timeout := flag.Int("timeout", 80, "HTTP timeout in seconds")
 	flag.Parse()
@@ -273,8 +274,40 @@ func main() {
 	printWg.Add(1)
 	go func() {
 		defer printWg.Done()
-		seen := make(map[string]struct{})
 		bufw := bufio.NewWriter(outWriter)
+		if *extractPaths {
+			// Extract unique path segments from each URL
+			seenSeg := make(map[string]struct{})
+			for r := range resultsCh {
+				u, err := url.Parse(r)
+				if err != nil || u.Path == "" {
+					continue
+				}
+				segs := strings.Split(u.Path, "/")
+				for _, seg := range segs {
+					seg = strings.TrimSpace(seg)
+					if seg == "" {
+						continue
+					}
+					if _, ok := seenSeg[seg]; ok {
+						continue
+					}
+					seenSeg[seg] = struct{}{}
+					pbar.ClearLine()
+					fmt.Fprintln(bufw, seg)
+					bufw.Flush()
+					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+				}
+			}
+			if outFile != nil {
+				bufw.Flush()
+				outFile.Close()
+				fmt.Fprintln(os.Stdout, "✔ Saved results to", *outputFile)
+			}
+			return
+		}
+		// Default: dedupe full lines
+		seen := make(map[string]struct{})
 		for r := range resultsCh {
 			if _, ok := seen[r]; ok {
 				continue
