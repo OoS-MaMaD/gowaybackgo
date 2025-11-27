@@ -105,6 +105,11 @@ Only print query parameter keys (unique):
 ```bash
 gowaybackgo -u "example.com" -only-query-keys
 ```
+Excluding default file extensions and removing query parameters:
+
+```bash
+gowaybackgo -u "example.com" -exclude-defaults -no-query
+```
 
 Pipe raw URLs to another command or file (progress bar will render on `/dev/tty` and not pollute stdout):
 
