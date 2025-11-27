@@ -144,7 +144,3 @@ gowaybackgo -u "example.com" > urls.txt
 ## License
 
 See the `LICENSE` file in this repository for licensing details.
-
----
-
-If you want, I can additionally add a few usage examples as shell scripts or small integration tests demonstrating the main workflows.
