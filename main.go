@@ -51,11 +51,11 @@ func normalizeURLForCDX(u string, subs bool) string {
 	s = strings.TrimPrefix(s, "http://")
 	s = strings.TrimPrefix(s, "https://")
 	// remove any path or port
-	if idx := strings.IndexAny(s, "/:\\\\"); idx >= 0 {
-		s = s[:idx]
-	}
-	s = strings.ReplaceAll(s, "*", "")
-	s = strings.Trim(s, " .")
+	//if idx := strings.IndexAny(s, "/:\\\\"); idx >= 0 {
+		//s = s[:idx]
+	//}
+	//s = strings.ReplaceAll(s, "*", "")
+	//s = strings.Trim(s, " .")
 	if subs {
 		// request leading wildcard for subdomain enumeration
 		return "*." + s
