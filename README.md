@@ -26,12 +26,6 @@ cd /path/to/gowaybackgo
 go build -o gowaybackgo
 ```
 
-Or run directly with `go run` during development:
-
-```bash
-go run main.go -- -u "*.example.com"
-```
-
 ## Usage
 
 All flags are defined in the program. At minimum pass `-u` with a target pattern:
