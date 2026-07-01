@@ -46,22 +46,27 @@ func normalizeURL(u string) string {
 // If subs==true we return a leading-wildcard base like "*.example.com" to get
 // subdomain captures. Otherwise we behave like normalizeURL (append a trailing
 // '*') unless the user already provided a wildcard.
+// NOTE: path/port stripping is intentionally not done here — the full URL
+// pattern (including any path) is passed through to the CDX API as-is.
 func normalizeURLForCDX(u string, subs bool) string {
 	s := strings.TrimSpace(u)
 	s = strings.TrimPrefix(s, "http://")
 	s = strings.TrimPrefix(s, "https://")
-	// remove any path or port
-	//if idx := strings.IndexAny(s, "/:\\\\"); idx >= 0 {
-		//s = s[:idx]
-	//}
-	//s = strings.ReplaceAll(s, "*", "")
-	//s = strings.Trim(s, " .")
+
 	if subs {
-		// request leading wildcard for subdomain enumeration
-		return "*." + s
+		// Request leading wildcard for subdomain enumeration.
+		// Strip to host only for subs mode so *.example.com/path doesn't break.
+		host := s
+		if idx := strings.IndexAny(host, "/:?#"); idx >= 0 {
+			host = host[:idx]
+		}
+		host = strings.Trim(host, " .")
+		return "*." + host
 	}
-	if !strings.Contains(u, "*") {
+
+	// For normal queries: preserve the full path, just append * if no wildcard.
+	if !strings.Contains(s, "*") {
 		return s + "*"
 	}
-	return u
+	return s
 }
