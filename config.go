@@ -10,6 +10,7 @@ import (
 // Config collects all CLI options for the tool.
 type Config struct {
 	URLPattern      string
+	URLList         []string // domains read from stdin when -stdin is set
 	OutputFile      string
 	OnlyQuery       bool
 	OnlyQueryKeys   bool
@@ -22,11 +23,14 @@ type Config struct {
 	ExtractPaths    bool
 	Subs            bool
 	Timeout         time.Duration
+	RateLimit       int // max CDX page requests per second (0 = unlimited)
+	Stdin           bool
 }
 
 // ParseConfig reads command-line flags into a Config struct.
 func ParseConfig() (*Config, error) {
-	urlFlag := flag.String("u", "", "Target URL pattern (e.g. *.example.com)")
+	urlFlag := flag.String("u", "", "Target URL/domain pattern (e.g. example.com or *.example.com)")
+	stdinFlag := flag.Bool("stdin", false, "Read target domains from stdin (one per line), ignores -u")
 	outputFile := flag.String("o", "", "Output file (also prints to stdout)")
 	onlyQuery := flag.Bool("only-query", false, "Output only full query strings")
 	onlyQueryKeys := flag.Bool("only-query-keys", false, "Output only query parameter keys")
@@ -36,17 +40,13 @@ func ParseConfig() (*Config, error) {
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
 	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
 	extractPaths := flag.Bool("extract-paths", false, "If set, extract unique path segments from each output URL and print each segment on its own line.")
-	subs := flag.Bool("subs", false, "Only print unique subdomains for the provided base URL (e.g. example.com -> a.example.com, b.example.com)")
-	pageWorkers := flag.Int("page-workers", 10, "Number of concurrent page fetchers (CDX pages)")
+	subs := flag.Bool("subs", false, "Only print unique subdomains for the provided base domain (e.g. example.com -> a.example.com, b.example.com)")
+	pageWorkers := flag.Int("page-workers", 10, "Number of concurrent CDX page fetchers")
 	timeout := flag.Int("timeout", 80, "HTTP timeout in seconds")
+	rateLimit := flag.Int("rate", 0, "Max CDX page requests per second (0 = unlimited). Recommended: 5-10 to avoid rate-limiting.")
 	flag.Parse()
 
-	if *urlFlag == "" {
-		return nil, fmt.Errorf("-u <url> is required")
-	}
-
-	return &Config{
-		URLPattern:      *urlFlag,
+	cfg := &Config{
 		OutputFile:      *outputFile,
 		OnlyQuery:       *onlyQuery,
 		OnlyQueryKeys:   *onlyQueryKeys,
@@ -59,7 +59,28 @@ func ParseConfig() (*Config, error) {
 		ExtractPaths:    *extractPaths,
 		Subs:            *subs,
 		Timeout:         time.Duration(*timeout) * time.Second,
-	}, nil
+		RateLimit:       *rateLimit,
+		Stdin:           *stdinFlag,
+	}
+
+	if *stdinFlag {
+		domains, err := readStdin()
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+		if len(domains) == 0 {
+			return nil, fmt.Errorf("no domains provided via stdin")
+		}
+		cfg.URLList = domains
+		cfg.URLPattern = domains[0]
+		return cfg, nil
+	}
+
+	if *urlFlag == "" {
+		return nil, fmt.Errorf("-u <url> is required (or use -stdin)")
+	}
+	cfg.URLPattern = *urlFlag
+	return cfg, nil
 }
 
 // EffectiveExclude determines the active exclusion list following user flags.

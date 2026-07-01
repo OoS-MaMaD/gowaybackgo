@@ -28,6 +28,7 @@ type Runner struct {
 	outFile     *os.File
 	outWriter   io.Writer
 	pbar        *PBar
+	rateLimiter <-chan time.Time // nil when no rate limiting
 }
 
 // NewRunner builds a Runner with compiled filters and output writers prepared.
@@ -47,6 +48,12 @@ func NewRunner(cfg *Config) (*Runner, error) {
 		outWriter:   os.Stdout,
 	}
 
+	// Set up rate limiter using a ticker channel if requested.
+	if cfg.RateLimit > 0 {
+		ticker := time.NewTicker(time.Second / time.Duration(cfg.RateLimit))
+		r.rateLimiter = ticker.C
+	}
+
 	if cfg.OutputFile != "" {
 		f, err := os.Create(cfg.OutputFile)
 		if err != nil {
@@ -60,7 +67,27 @@ func NewRunner(cfg *Config) (*Runner, error) {
 }
 
 // Run executes the full fetch/process/print pipeline.
+// If multiple URLList entries are set (via --stdin), each domain is processed
+// sequentially so results are not interleaved.
 func (r *Runner) Run(ctx context.Context) error {
+	domains := r.cfg.URLList
+	if len(domains) == 0 {
+		domains = []string{r.cfg.URLPattern}
+	}
+
+	for _, domain := range domains {
+		// Temporarily override URLPattern so all helper functions pick up the
+		// current domain without a full refactor.
+		r.cfg.URLPattern = domain
+		r.baseDomain = r.cfg.NormalizeBaseDomain()
+		if err := r.runSingle(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runner) runSingle(ctx context.Context) error {
 	pages, err := r.fetchPageCount(ctx)
 	if err != nil {
 		return err
@@ -75,14 +102,20 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.pbar = NewPBar(pages)
 	r.pbar.Render(0)
 
+	// Size the jobs channel to twice the number of page workers so fetchers are
+	// never blocked for long, but memory use stays bounded.
+	jobsBuf := r.cfg.PageWorkers * 2
+	if jobsBuf < 64 {
+		jobsBuf = 64
+	}
+
 	pageJobs := make(chan int, r.cfg.PageWorkers)
-	jobs := make(chan string, 2000)
-	resultsCh := make(chan string, 2000)
+	jobs := make(chan string, jobsBuf)
+	resultsCh := make(chan string, jobsBuf)
 
 	var pagesCompleted int32
 	fetchWg := r.startPageFetchers(ctx, pageJobs, jobs, &pagesCompleted)
 	workerWg := r.startWorkers(jobs, resultsCh)
-
 	printWg := r.startPrinter(resultsCh, &pagesCompleted)
 
 	for p := 0; p < pages; p++ {
@@ -101,7 +134,9 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
-	pagesURL := "http://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURLForCDX(r.cfg.URLPattern, r.cfg.Subs)) + "&showNumPages=true"
+	pagesURL := "https://web.archive.org/cdx/search/cdx?url=" +
+		url.QueryEscape(normalizeURLForCDX(r.cfg.URLPattern, r.cfg.Subs)) +
+		"&showNumPages=true"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pagesURL, nil)
 	if err != nil {
@@ -113,6 +148,10 @@ func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("fetch page count: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("CDX page count returned HTTP %d", resp.StatusCode)
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	numStr := ""
@@ -150,11 +189,24 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 		go func() {
 			defer fetchWg.Done()
 			for p := range pageJobs {
-				pageURL := "https://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURLForCDX(r.cfg.URLPattern, r.cfg.Subs)) + "&page=" + strconv.Itoa(p) + "&fl=original&collapse=urlkey"
-
+				// Honour context cancellation before dispatching each page.
 				if ctx.Err() != nil {
 					return
 				}
+
+				// Apply rate limiting if configured.
+				if r.rateLimiter != nil {
+					select {
+					case <-r.rateLimiter:
+					case <-ctx.Done():
+						return
+					}
+				}
+
+				pageURL := "https://web.archive.org/cdx/search/cdx?url=" +
+					url.QueryEscape(normalizeURLForCDX(r.cfg.URLPattern, r.cfg.Subs)) +
+					"&page=" + strconv.Itoa(p) +
+					"&fl=original&collapse=urlkey"
 
 				respP, ierr := r.fetchWithRetry(ctx, pageURL, pagesCompleted)
 				if ierr != nil || respP == nil {
@@ -186,33 +238,63 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 	return &fetchWg
 }
 
+// fetchWithRetry attempts up to maxRetries fetches with exponential back-off.
+// It surfaces non-2xx HTTP status codes as errors and respects context
+// cancellation between attempts.
 func (r *Runner) fetchWithRetry(ctx context.Context, pageURL string, pagesCompleted *int32) (*http.Response, error) {
-	var respP *http.Response
-	var ierr error
+	var lastErr error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Check context before every attempt.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 		if err != nil {
-			ierr = err
-			break
+			return nil, err // non-retryable
 		}
 
-		respP, ierr = r.client.Do(req)
-		if ierr == nil && respP != nil && respP.StatusCode >= http.StatusOK && respP.StatusCode < http.StatusMultipleChoices {
-			return respP, nil
+		resp, err := r.client.Do(req)
+		if err != nil {
+			lastErr = err
+		} else if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			return resp, nil
+		} else {
+			// Treat non-2xx as a retryable error; surface the status code clearly.
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			resp.Body.Close()
+
+			// For 429 (rate limited) or 5xx use a longer back-off.
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				backoff := time.Duration(attempt*attempt) * time.Second // 1s, 4s, 9s
+				msg := fmt.Sprintf("⚠ HTTP %d on page fetch; backing off %s (attempt %d/%d)",
+					resp.StatusCode, backoff, attempt, maxRetries)
+				r.pbar.Log(msg, "\033[33m")
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				continue
+			}
 		}
 
-		if respP != nil {
-			respP.Body.Close()
+		if attempt < maxRetries {
+			backoff := time.Duration(attempt) * time.Second
+			msg := fmt.Sprintf("⚠ retrying page fetch (attempt %d/%d): %v", attempt, maxRetries, lastErr)
+			r.pbar.Log(msg, "\033[33m")
+			if pagesCompleted != nil {
+				r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
+			}
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
-		msg := fmt.Sprintf("⚠ retrying page fetch after error: %v", ierr)
-		r.pbar.Log(msg, "\033[33m")
-		if pagesCompleted != nil {
-			r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
-		}
-		time.Sleep(time.Duration(attempt) * time.Second)
 	}
-	return nil, ierr
+	return nil, lastErr
 }
 
 func (r *Runner) startWorkers(jobs <-chan string, resultsCh chan<- string) *sync.WaitGroup {
@@ -248,7 +330,9 @@ func (r *Runner) processLine(line string) []string {
 		path = u.Path
 	}
 
-	if r.extRegex != nil {
+	// Extension filter does not apply when in subdomain-only mode, to avoid
+	// accidentally dropping valid subdomain URLs based on their path extension.
+	if r.extRegex != nil && !r.cfg.Subs {
 		match := r.extRegex.MatchString(path)
 		if r.includeMode && !match {
 			return nil
@@ -394,8 +478,8 @@ func (r *Runner) writeWithProgress(bufw *bufio.Writer, value string, pagesComple
 }
 
 func (r *Runner) finishOutput(bufw *bufio.Writer) {
+	bufw.Flush()
 	if r.outFile != nil {
-		bufw.Flush()
 		r.outFile.Close()
 		fmt.Fprintln(os.Stdout, "✔ Saved results to", r.cfg.OutputFile)
 	}
