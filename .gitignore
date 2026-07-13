@@ -1,0 +1,8 @@
+# Compiled binary (built from this module)
+/gowaybackgo
+gowaybackgo.exe
+
+# Go build/test artifacts
+*.out
+*.test
+dist/

@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 )
 
 const defaultExclude = "js,css,png,jpg,jpeg,gif,svg,webp,ico,bmp,tif,tiff,woff,woff2,ttf,eot,mp4,mp3,wav,avi,mov,mkv,zip,rar,7z,pdf"
@@ -24,7 +26,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	// Cancel the run cleanly on Ctrl-C / SIGTERM. The fetch/retry/print paths
+	// already honour ctx cancellation, so this drains in-flight work and closes
+	// the output file instead of leaving a half-written terminal or file.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if err := runner.Run(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "❌ ERROR:", err)
 		os.Exit(1)

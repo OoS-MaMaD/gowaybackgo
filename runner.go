@@ -18,6 +18,10 @@ import (
 
 const maxRetries = 3
 
+// userAgent is sent on every CDX request. web.archive.org throttles or blocks
+// the default Go client UA, so identify the tool explicitly.
+const userAgent = "gowaybackgo (+github.com/OoS-MaMaD/gowaybackgo)"
+
 // Runner encapsulates the orchestration needed to fetch CDX pages and process results.
 type Runner struct {
 	cfg         *Config
@@ -75,7 +79,17 @@ func (r *Runner) Run(ctx context.Context) error {
 		domains = []string{r.cfg.URLPattern}
 	}
 
+	// The output file is opened once in NewRunner and closed once here, after
+	// every domain has been processed. Closing per-domain (the old behaviour)
+	// left later domains writing to a closed handle through the MultiWriter,
+	// which silently dropped their output.
+	defer r.closeOutput()
+
 	for _, domain := range domains {
+		// Stop launching new domains once cancelled.
+		if ctx.Err() != nil {
+			break
+		}
 		// Temporarily override URLPattern so all helper functions pick up the
 		// current domain without a full refactor.
 		r.cfg.URLPattern = domain
@@ -93,9 +107,8 @@ func (r *Runner) runSingle(ctx context.Context) error {
 		return err
 	}
 
-	if pages == 0 {
+	if pages <= 0 {
 		fmt.Fprintln(os.Stderr, "No pages reported by CDX; nothing to do.")
-		r.closeOutput()
 		return nil
 	}
 
@@ -118,8 +131,16 @@ func (r *Runner) runSingle(ctx context.Context) error {
 	workerWg := r.startWorkers(jobs, resultsCh)
 	printWg := r.startPrinter(resultsCh, &pagesCompleted)
 
+	// Dispatch page numbers, but stop early if the run is cancelled. Without the
+	// ctx.Done() case, a cancellation that drains all fetchers would leave this
+	// send blocking forever once pageJobs fills, deadlocking shutdown.
+dispatch:
 	for p := 0; p < pages; p++ {
-		pageJobs <- p
+		select {
+		case pageJobs <- p:
+		case <-ctx.Done():
+			break dispatch
+		}
 	}
 	close(pageJobs)
 
@@ -142,6 +163,7 @@ func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("build page count request: %w", err)
 	}
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := r.client.Do(req)
 	if err != nil {
@@ -218,6 +240,7 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 				}
 
 				sc := bufio.NewScanner(respP.Body)
+				sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 				for sc.Scan() {
 					line := strings.TrimSpace(sc.Text())
 					if line != "" {
@@ -254,6 +277,7 @@ func (r *Runner) fetchWithRetry(ctx context.Context, pageURL string, pagesComple
 		if err != nil {
 			return nil, err // non-retryable
 		}
+		req.Header.Set("User-Agent", userAgent)
 
 		resp, err := r.client.Do(req)
 		if err != nil {
@@ -472,21 +496,23 @@ func (r *Runner) printDefault(bufw *bufio.Writer, resultsCh <-chan string, pages
 
 func (r *Runner) writeWithProgress(bufw *bufio.Writer, value string, pagesCompleted *int32) {
 	r.pbar.ClearLine()
-	fmt.Fprintln(bufw, value)
-	bufw.Flush()
+	fmt.Fprintln(bufw, sanitizeForTerminal(value))
 	r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 }
 
+// finishOutput flushes the per-domain buffered writer. The underlying file is
+// left open so subsequent domains can keep appending; it is closed once by
+// closeOutput after the whole run completes.
 func (r *Runner) finishOutput(bufw *bufio.Writer) {
 	bufw.Flush()
-	if r.outFile != nil {
-		r.outFile.Close()
-		fmt.Fprintln(os.Stdout, "✔ Saved results to", r.cfg.OutputFile)
-	}
 }
 
+// closeOutput closes the output file once, at the end of the run, and reports
+// where results were saved. Safe to call when no output file is configured.
 func (r *Runner) closeOutput() {
 	if r.outFile != nil {
 		r.outFile.Close()
+		r.outFile = nil
+		fmt.Fprintln(os.Stdout, "✔ Saved results to", r.cfg.OutputFile)
 	}
 }
