@@ -122,6 +122,10 @@ func printUsage() {
 	row("--proxy <url>", "Route via http/https/socks5 proxy")
 	cont("falls back to HTTP_PROXY/HTTPS_PROXY env if unset")
 
+	head("MISC")
+	row("--version", "Print version and exit")
+	row("-h, --help", "Show this help")
+
 	head("EXAMPLES")
 	ex("gowaybackgo -u example.com --exclude-defaults -o urls.txt")
 	ex("gowaybackgo -u example.com --subs")
@@ -158,7 +162,13 @@ func ParseConfig() (*Config, error) {
 	status := flag.String("status", "", "")
 	mime := flag.String("mime", "", "")
 	proxy := flag.String("proxy", "", "")
+	versionFlag := flag.Bool("version", false, "")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println("gowaybackgo", version)
+		os.Exit(0)
+	}
 
 	cfg := &Config{
 		OutputFile:      *outputFile,

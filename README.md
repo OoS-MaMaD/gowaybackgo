@@ -41,6 +41,14 @@ go build -o gowaybackgo
 
 Requires Go 1.24+ (standard library only).
 
+Verify it works and check the version:
+
+```bash
+gowaybackgo --version
+```
+
+Release binaries report their tag (e.g. `gowaybackgo v1.2.3`); builds from source report `dev`.
+
 ## Quick start
 
 ```bash
@@ -103,6 +111,13 @@ gowaybackgo -u example.com --json --status 200 --mime text/html
 | `--workers <n>` | `20` | Concurrent URL processors. |
 | `--timeout <sec>` | `80` | Per-request HTTP timeout. |
 | `--proxy <url>` | — | Route requests through `http://`, `https://`, or `socks5://` proxy. Falls back to `HTTP_PROXY`/`HTTPS_PROXY` when unset. |
+
+### Misc
+
+| Flag | Description |
+|------|-------------|
+| `--version` | Print the version and exit. |
+| `-h`, `--help` | Show the help/usage. |
 
 ### Extension filtering rules
 
