@@ -92,10 +92,15 @@ func NewRunner(cfg *Config) (*Runner, error) {
 		outWriter:      os.Stdout,
 	}
 
-	// Set up rate limiter using a ticker channel if requested.
+	// Set up rate limiter using a ticker channel if requested. Floor the interval
+	// at 1ns so an extreme --rate (> 1e9) can't divide to a zero interval, which
+	// would panic NewTicker; such a rate degrades to effectively unlimited.
 	if cfg.RateLimit > 0 {
-		ticker := time.NewTicker(time.Second / time.Duration(cfg.RateLimit))
-		r.rateLimiter = ticker.C
+		interval := time.Second / time.Duration(cfg.RateLimit)
+		if interval < 1 {
+			interval = 1
+		}
+		r.rateLimiter = time.NewTicker(interval).C
 	}
 
 	if cfg.OutputFile != "" {
@@ -154,6 +159,10 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) runSingle(ctx context.Context) error {
+	// Reset so the page-count phase (before the bar exists) logs to stderr rather
+	// than through a previous domain's finished bar.
+	r.pbar = nil
+
 	pages, err := r.fetchPageCount(ctx)
 	if err != nil {
 		return err
@@ -167,14 +176,21 @@ func (r *Runner) runSingle(ctx context.Context) error {
 	r.pbar = NewPBar(pages)
 	r.pbar.Render(0)
 
+	// Clamp defensively; validate() already rejects < 1, but this keeps a
+	// directly-constructed Runner from panicking on a negative channel size.
+	pageWorkers := r.cfg.PageWorkers
+	if pageWorkers < 1 {
+		pageWorkers = 1
+	}
+
 	// Size the jobs channel to twice the number of page workers so fetchers are
 	// never blocked for long, but memory use stays bounded.
-	jobsBuf := r.cfg.PageWorkers * 2
+	jobsBuf := pageWorkers * 2
 	if jobsBuf < 64 {
 		jobsBuf = 64
 	}
 
-	pageJobs := make(chan int, r.cfg.PageWorkers)
+	pageJobs := make(chan int, pageWorkers)
 	jobs := make(chan string, jobsBuf)
 	resultsCh := make(chan string, jobsBuf)
 
@@ -279,7 +295,7 @@ func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
 	}
 	pages, err := strconv.Atoi(numStr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "⚠ WARNING: could not parse page count (", numStr, "), defaulting to 1 page")
+		fmt.Fprintln(os.Stderr, "⚠ WARNING: could not parse page count (", sanitizeForTerminal(numStr), "), defaulting to 1 page")
 		return 1, nil
 	}
 	return pages, nil

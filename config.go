@@ -248,6 +248,21 @@ func (c *Config) validate() error {
 		return fmt.Errorf("only one output mode may be set, but got %s", strings.Join(active, ", "))
 	}
 
+	// Numeric flags: reject values that are nonsensical (and would otherwise
+	// panic later, e.g. a negative channel size or a zero ticker interval).
+	if c.Workers < 1 {
+		return fmt.Errorf("--workers must be >= 1, got %d", c.Workers)
+	}
+	if c.PageWorkers < 1 {
+		return fmt.Errorf("--page-workers must be >= 1, got %d", c.PageWorkers)
+	}
+	if c.Timeout <= 0 {
+		return fmt.Errorf("--timeout must be >= 1 second")
+	}
+	if c.RateLimit < 0 {
+		return fmt.Errorf("--rate must be >= 0 (0 = unlimited), got %d", c.RateLimit)
+	}
+
 	// --no-query is a transform on default output; it does nothing under the
 	// exclusive modes above. Warn rather than fail.
 	if c.NoQuery && len(active) == 1 {
