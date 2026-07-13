@@ -6,14 +6,50 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 )
 
 const defaultExclude = "js,css,png,jpg,jpeg,gif,svg,webp,ico,bmp,tif,tiff,woff,woff2,ttf,eot,mp4,mp3,wav,avi,mov,mkv,zip,rar,7z,pdf"
 
-// version is overridden at release time via -ldflags "-X main.version=<tag>".
-var version = "dev"
+// version is set at release time via -ldflags "-X main.version=<tag>". When
+// empty, appVersion falls back to Go's embedded build info.
+var version string
+
+// appVersion resolves the version to report. Precedence: the release ldflag,
+// then the module version (set for `go install <module>@vX.Y.Z`), then the VCS
+// revision embedded for local builds, then "dev".
+func appVersion() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+		var rev string
+		var dirty bool
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				rev = s.Value
+			case "vcs.modified":
+				dirty = s.Value == "true"
+			}
+		}
+		if rev != "" {
+			if len(rev) > 12 {
+				rev = rev[:12]
+			}
+			if dirty {
+				rev += "-dirty"
+			}
+			return rev
+		}
+	}
+	return "dev"
+}
 
 func main() {
 	cfg, err := ParseConfig()

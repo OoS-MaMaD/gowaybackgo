@@ -80,7 +80,7 @@ func printUsage() {
 
 	// Logo with the version shown small (dimmed) beside the tagline.
 	fmt.Fprintf(w, "\n%s%s%s\n\n", p.cyan, logo, p.reset)
-	fmt.Fprintf(w, "  %sWayback Machine CDX URL fetcher%s  %s%s%s\n", p.bold, p.reset, p.dim, version, p.reset)
+	fmt.Fprintf(w, "  %sWayback Machine CDX URL fetcher%s  %s%s%s\n", p.bold, p.reset, p.dim, appVersion(), p.reset)
 	fmt.Fprintf(w, "  %sgithub.com/OoS-MaMaD/gowaybackgo%s\n", p.dim, p.reset)
 
 	head("USAGE")
@@ -166,7 +166,7 @@ func ParseConfig() (*Config, error) {
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Println("gowaybackgo", version)
+		fmt.Println("gowaybackgo", appVersion())
 		os.Exit(0)
 	}
 

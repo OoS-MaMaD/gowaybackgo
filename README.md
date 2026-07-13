@@ -47,7 +47,9 @@ Verify it works and check the version:
 gowaybackgo --version
 ```
 
-Release binaries report their tag (e.g. `gowaybackgo v1.2.3`); builds from source report `dev`.
+The version is resolved from the release tag (prebuilt binaries), Go's module
+version (`go install …@vX.Y.Z`), or the VCS commit for a local checkout — falling
+back to `dev` only when none is available.
 
 ## Quick start
 
