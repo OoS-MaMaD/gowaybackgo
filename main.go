@@ -12,6 +12,9 @@ import (
 
 const defaultExclude = "js,css,png,jpg,jpeg,gif,svg,webp,ico,bmp,tif,tiff,woff,woff2,ttf,eot,mp4,mp3,wav,avi,mov,mkv,zip,rar,7z,pdf"
 
+// version is overridden at release time via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 func main() {
 	cfg, err := ParseConfig()
 	if err != nil {

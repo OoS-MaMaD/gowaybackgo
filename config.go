@@ -38,79 +38,99 @@ type Config struct {
 	excludeFlagSet bool
 }
 
-const banner = `
-  __ _  _____      ____ _ _   _| |__   __ _  ___| | ____ _  ___
+const logo = `  __ _  _____      ____ _ _   _| |__   __ _  ___| | ____ _  ___
  / _` + "`" + ` |/ _ \ \ /\ / / _` + "`" + ` | | | | '_ \ / _` + "`" + ` |/ __| |/ / _` + "`" + ` |/ _ \
 | (_| | (_) \ V  V / (_| | |_| | |_) | (_| | (__|   < (_| | (_) |
  \__, |\___/ \_/\_/ \__,_|\__, |_.__/ \__,_|\___|_|\_\__, |\___/
   __/ |                    __/ |                      __/ |
- |___/                    |___/                      |___/
+ |___/                    |___/                      |___/`
 
-  Wayback Machine CDX URL fetcher — with more options
-  github.com/OoS-MaMaD/gowaybackgo
-`
+// usagePalette holds ANSI codes for the help output. All fields are empty when
+// color is disabled (NO_COLOR set, or stderr is not a terminal).
+type usagePalette struct{ reset, bold, dim, cyan, green string }
+
+func newUsagePalette() usagePalette {
+	if os.Getenv("NO_COLOR") != "" || !isTerminal(os.Stderr.Fd()) {
+		return usagePalette{}
+	}
+	return usagePalette{
+		reset: "\033[0m", bold: "\033[1m", dim: "\033[2m",
+		cyan: "\033[36m", green: "\033[32m",
+	}
+}
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, banner)
-	fmt.Fprintln(os.Stderr, "USAGE")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u <target> [options]")
-	fmt.Fprintln(os.Stderr, "  cat domains.txt | gowaybackgo --stdin [options]")
-	fmt.Fprintln(os.Stderr, "")
+	w := os.Stderr
+	p := newUsagePalette()
 
-	fmt.Fprintln(os.Stderr, "TARGET")
-	fmt.Fprintln(os.Stderr, "  -u <pattern>          Target URL or domain pattern")
-	fmt.Fprintln(os.Stderr, "                          e.g.  example.com")
-	fmt.Fprintln(os.Stderr, "                                example.com/api/v1")
-	fmt.Fprintln(os.Stderr, "                                *.example.com")
-	fmt.Fprintln(os.Stderr, "  --stdin               Read targets from stdin (one per line, # = comment)")
-	fmt.Fprintln(os.Stderr, "")
+	head := func(title string) {
+		fmt.Fprintf(w, "\n%s%s%s%s\n", p.bold, p.cyan, title, p.reset)
+	}
+	// row prints a flag and its description, aligned in a fixed column.
+	row := func(name, desc string) {
+		fmt.Fprintf(w, "  %s%-21s%s %s\n", p.green, name, p.reset, desc)
+	}
+	// cont prints a dimmed continuation line under the description column.
+	cont := func(text string) {
+		fmt.Fprintf(w, "  %-21s %s%s%s\n", "", p.dim, text, p.reset)
+	}
+	ex := func(cmd string) {
+		fmt.Fprintf(w, "  %s$%s %s\n", p.dim, p.reset, cmd)
+	}
 
-	fmt.Fprintln(os.Stderr, "OUTPUT")
-	fmt.Fprintln(os.Stderr, "  -o <file>             Write results to file (also prints to stdout)")
-	fmt.Fprintln(os.Stderr, "  --only-query          Print full query strings only   e.g. foo=1&bar=2")
-	fmt.Fprintln(os.Stderr, "  --only-query-keys     Print query parameter keys only e.g. foo, bar")
-	fmt.Fprintln(os.Stderr, "  --no-query            Strip query strings from output URLs")
-	fmt.Fprintln(os.Stderr, "  --extract-paths       Print unique path segments (one per line)")
-	fmt.Fprintln(os.Stderr, "  --subs                Print unique subdomains of the target domain")
-	fmt.Fprintln(os.Stderr, "  --json                Emit JSONL: {\"url\",\"timestamp\",\"status\",\"mime\"}")
-	fmt.Fprintln(os.Stderr, "                          (output modes above are mutually exclusive)")
-	fmt.Fprintln(os.Stderr, "")
+	// Logo with the version shown small (dimmed) beside the tagline.
+	fmt.Fprintf(w, "\n%s%s%s\n\n", p.cyan, logo, p.reset)
+	fmt.Fprintf(w, "  %sWayback Machine CDX URL fetcher%s  %s%s%s\n", p.bold, p.reset, p.dim, version, p.reset)
+	fmt.Fprintf(w, "  %sgithub.com/OoS-MaMaD/gowaybackgo%s\n", p.dim, p.reset)
 
-	fmt.Fprintln(os.Stderr, "FILTERING")
-	fmt.Fprintln(os.Stderr, "  --exclude-ext <exts>  Comma-separated extensions to exclude (e.g. js,css,png)")
-	fmt.Fprintln(os.Stderr, "  --exclude-defaults    Exclude common static file extensions:")
-	fmt.Fprintln(os.Stderr, "                          js css png jpg jpeg gif svg webp ico bmp tif tiff")
-	fmt.Fprintln(os.Stderr, "                          woff woff2 ttf eot mp4 mp3 wav avi mov mkv zip rar 7z pdf")
-	fmt.Fprintln(os.Stderr, "  --include-ext <exts>  Only include these extensions (overrides exclude)")
-	fmt.Fprintln(os.Stderr, "  --from <ts>           Only captures at/after this time (yyyy[MMdd[hhmmss]])")
-	fmt.Fprintln(os.Stderr, "  --to <ts>             Only captures at/before this time (yyyy[MMdd[hhmmss]])")
-	fmt.Fprintln(os.Stderr, "  --status <re>         CDX statuscode filter   e.g. 200  2..  (200|301)")
-	fmt.Fprintln(os.Stderr, "  --mime <re>           CDX mimetype filter     e.g. text/html  application/json")
-	fmt.Fprintln(os.Stderr, "")
+	head("USAGE")
+	ex("gowaybackgo -u <target> [options]")
+	ex("cat domains.txt | gowaybackgo --stdin [options]")
 
-	fmt.Fprintln(os.Stderr, "PERFORMANCE")
-	fmt.Fprintln(os.Stderr, "  --rate <n>            Max CDX requests/sec (default: 0 = unlimited)")
-	fmt.Fprintln(os.Stderr, "                          Recommended: 5-10 to avoid hitting rate limits")
-	fmt.Fprintln(os.Stderr, "  --page-workers <n>    Concurrent CDX page fetchers   (default: 10)")
-	fmt.Fprintln(os.Stderr, "  --workers <n>         Concurrent URL processors      (default: 20)")
-	fmt.Fprintln(os.Stderr, "  --timeout <sec>       HTTP timeout in seconds         (default: 80)")
-	fmt.Fprintln(os.Stderr, "  --proxy <url>         Route requests through a proxy")
-	fmt.Fprintln(os.Stderr, "                          http://host:port  https://...  socks5://host:port")
-	fmt.Fprintln(os.Stderr, "                          (falls back to HTTP_PROXY/HTTPS_PROXY env if unset)")
-	fmt.Fprintln(os.Stderr, "")
+	head("TARGET")
+	row("-u <pattern>", "Target URL or domain pattern")
+	cont("e.g.  example.com   example.com/api/v1   *.example.com")
+	row("--stdin", "Read targets from stdin (one per line, # = comment)")
 
-	fmt.Fprintln(os.Stderr, "EXAMPLES")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --exclude-defaults -o urls.txt")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --subs")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --only-query-keys")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com/api --include-ext json,xml")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --rate 5 --page-workers 5")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --json --status 200 --mime text/html")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --from 2020 --to 2022 -o urls.txt")
-	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --proxy http://127.0.0.1:8080")
-	fmt.Fprintln(os.Stderr, "  cat domains.txt | gowaybackgo --stdin --exclude-defaults")
-	fmt.Fprintln(os.Stderr, "")
+	head("OUTPUT  (modes are mutually exclusive)")
+	row("-o <file>", "Write results to file (also prints to stdout)")
+	row("--only-query", "Print full query strings only    e.g. foo=1&bar=2")
+	row("--only-query-keys", "Print query parameter keys only  e.g. foo, bar")
+	row("--no-query", "Strip query strings from output URLs")
+	row("--extract-paths", "Print unique path segments (one per line)")
+	row("--subs", "Print unique subdomains of the target domain")
+	row("--json", `Emit JSONL: {"url","timestamp","status","mime"}`)
+
+	head("FILTERING")
+	row("--exclude-ext <exts>", "Comma-separated extensions to exclude (e.g. js,css,png)")
+	row("--exclude-defaults", "Exclude common static file extensions:")
+	cont("js css png jpg jpeg gif svg webp ico bmp tif tiff")
+	cont("woff woff2 ttf eot mp4 mp3 wav avi mov mkv")
+	cont("zip rar 7z pdf")
+	row("--include-ext <exts>", "Only include these extensions (overrides exclude)")
+	row("--from <ts>", "Only captures at/after this time (yyyy[MMdd[hhmmss]])")
+	row("--to <ts>", "Only captures at/before this time (yyyy[MMdd[hhmmss]])")
+	row("--status <re>", "CDX statuscode filter   e.g. 200  2..  (200|301)")
+	row("--mime <re>", "CDX mimetype filter     e.g. text/html  application/json")
+
+	head("PERFORMANCE")
+	row("--rate <n>", "Max CDX requests/sec (default: 0 = unlimited)")
+	cont("recommended 5-10 to avoid hitting rate limits")
+	row("--page-workers <n>", "Concurrent CDX page fetchers   (default: 10)")
+	row("--workers <n>", "Concurrent URL processors      (default: 20)")
+	row("--timeout <sec>", "HTTP timeout in seconds        (default: 80)")
+	row("--proxy <url>", "Route via http/https/socks5 proxy")
+	cont("falls back to HTTP_PROXY/HTTPS_PROXY env if unset")
+
+	head("EXAMPLES")
+	ex("gowaybackgo -u example.com --exclude-defaults -o urls.txt")
+	ex("gowaybackgo -u example.com --subs")
+	ex("gowaybackgo -u example.com/api --include-ext json,xml")
+	ex("gowaybackgo -u example.com --json --status 200 --mime text/html")
+	ex("gowaybackgo -u example.com --from 2020 --to 2022 -o urls.txt")
+	ex("gowaybackgo -u example.com --proxy http://127.0.0.1:8080")
+	ex("cat domains.txt | gowaybackgo --stdin --exclude-defaults")
+	fmt.Fprintln(w)
 }
 
 // ParseConfig reads command-line flags into a Config struct.

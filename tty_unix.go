@@ -14,11 +14,9 @@ type winsize struct {
 	Row, Col, Xpixel, Ypixel uint16
 }
 
-// ttyColumns returns the terminal width (columns) for fd via the TIOCGWINSZ
-// ioctl, or 0 if it can't be determined (fd is not a terminal, or the call
-// fails). Stdlib-only; kept behind a build tag so the Windows release target
-// (which has no such ioctl) uses the fallback in tty_other.go instead.
-func ttyColumns(fd uintptr) int {
+// winsizeIoctl runs TIOCGWINSZ on fd, returning the reported size and whether
+// the call succeeded (i.e. fd is a terminal).
+func winsizeIoctl(fd uintptr) (winsize, bool) {
 	ws := &winsize{}
 	_, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
@@ -26,8 +24,26 @@ func ttyColumns(fd uintptr) int {
 		uintptr(syscall.TIOCGWINSZ),
 		uintptr(unsafe.Pointer(ws)),
 	)
-	if errno != 0 {
+	return *ws, errno == 0
+}
+
+// ttyColumns returns the terminal width (columns) for fd, or 0 if it can't be
+// determined (fd is not a terminal, or the terminal reports no width). Stdlib-
+// only; kept behind a build tag so the Windows release target (which has no such
+// ioctl) uses the fallback in tty_other.go instead.
+func ttyColumns(fd uintptr) int {
+	ws, ok := winsizeIoctl(fd)
+	if !ok {
 		return 0
 	}
 	return int(ws.Col)
+}
+
+// isTerminal reports whether fd refers to a terminal. Unlike ttyColumns it does
+// not care about the reported width, so a terminal with an unset window size
+// (e.g. some CI ptys) is still detected — the right primitive for deciding
+// whether to emit color.
+func isTerminal(fd uintptr) bool {
+	_, ok := winsizeIoctl(fd)
+	return ok
 }

@@ -57,7 +57,7 @@ func NewPBar(total int) *PBar {
 		OngoingStr:  ".",
 		start:       time.Now(),
 		noColor:     noColor,
-		colorStderr: !noColor && ttyColumns(os.Stderr.Fd()) > 0,
+		colorStderr: !noColor && isTerminal(os.Stderr.Fd()),
 	}
 	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
 		p.out = tty
