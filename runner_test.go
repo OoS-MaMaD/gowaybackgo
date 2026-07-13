@@ -176,6 +176,7 @@ func TestCDXURL(t *testing.T) {
 			Status: "200",
 			Mime:   "text/html",
 		},
+		baseURL:        cdxBaseURL,
 		currentPattern: "https://example.com/api",
 	}
 

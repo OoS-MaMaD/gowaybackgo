@@ -23,6 +23,10 @@ const maxRetries = 3
 // the default Go client UA, so identify the tool explicitly.
 const userAgent = "gowaybackgo (+github.com/OoS-MaMaD/gowaybackgo)"
 
+// cdxBaseURL is the Wayback CDX endpoint. Held as a Runner field (defaulting
+// here) so tests can point the whole pipeline at a local server.
+const cdxBaseURL = "https://web.archive.org/cdx/search/cdx"
+
 const (
 	colorRed    = "\033[31m"
 	colorYellow = "\033[33m"
@@ -54,6 +58,7 @@ func (r *Runner) logStatus(msg, color string) {
 type Runner struct {
 	cfg            *Config
 	client         *http.Client
+	baseURL        string // CDX endpoint; overridable in tests
 	extRegex       *regexp.Regexp
 	includeMode    bool
 	currentPattern string // target currently being processed (per --stdin domain)
@@ -85,6 +90,7 @@ func NewRunner(cfg *Config) (*Runner, error) {
 	r := &Runner{
 		cfg:            cfg,
 		client:         client,
+		baseURL:        cdxBaseURL,
 		extRegex:       extRegex,
 		includeMode:    includeMode,
 		currentPattern: cfg.URLPattern,
@@ -265,7 +271,7 @@ func (r *Runner) cdxURL(page int, numPages bool) string {
 	for _, f := range r.cdxFilters() {
 		v.Add("filter", f)
 	}
-	return "https://web.archive.org/cdx/search/cdx?" + v.Encode()
+	return r.baseURL + "?" + v.Encode()
 }
 
 func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
