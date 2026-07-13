@@ -123,6 +123,9 @@ func TestNormalizeURLForCDX(t *testing.T) {
 		{"example.com", true, "*.example.com"},
 		{"https://example.com/path?q=1", true, "*.example.com"},
 		{"https://example.com:8080/x", true, "*.example.com"},
+		{"*.example.com", true, "*.example.com"},      // already wildcarded: no double prefix
+		{"*.example.com/path", true, "*.example.com"}, // wildcard preserved, path stripped
+		{"example.*", true, "example.*"},              // explicit wildcard honored as-is
 	}
 	for _, tt := range tests {
 		got := normalizeURLForCDX(tt.in, tt.subs)

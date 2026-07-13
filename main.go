@@ -57,6 +57,12 @@ func normalizeURLForCDX(u string, subs bool) string {
 			host = host[:idx]
 		}
 		host = strings.Trim(host, " .")
+		// Honor an explicit wildcard instead of prepending another (mirrors the
+		// non-subs branch below): "*.example.com" must stay "*.example.com", not
+		// become "*.*.example.com".
+		if strings.Contains(host, "*") {
+			return host
+		}
 		return "*." + host
 	}
 
