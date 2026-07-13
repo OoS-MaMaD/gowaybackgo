@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,15 +25,16 @@ const userAgent = "gowaybackgo (+github.com/OoS-MaMaD/gowaybackgo)"
 
 // Runner encapsulates the orchestration needed to fetch CDX pages and process results.
 type Runner struct {
-	cfg         *Config
-	client      *http.Client
-	extRegex    *regexp.Regexp
-	includeMode bool
-	baseDomain  string
-	outFile     *os.File
-	outWriter   io.Writer
-	pbar        *PBar
-	rateLimiter <-chan time.Time // nil when no rate limiting
+	cfg            *Config
+	client         *http.Client
+	extRegex       *regexp.Regexp
+	includeMode    bool
+	currentPattern string // target currently being processed (per --stdin domain)
+	baseDomain     string
+	outFile        *os.File
+	outWriter      io.Writer
+	pbar           *PBar
+	rateLimiter    <-chan time.Time // nil when no rate limiting
 }
 
 // NewRunner builds a Runner with compiled filters and output writers prepared.
@@ -43,13 +45,25 @@ func NewRunner(cfg *Config) (*Runner, error) {
 		return nil, fmt.Errorf("compile extension regex: %w", err)
 	}
 
+	client := &http.Client{Timeout: cfg.Timeout}
+	// An explicit --proxy wins; otherwise the default transport already honours
+	// HTTP_PROXY/HTTPS_PROXY from the environment.
+	if cfg.Proxy != "" {
+		pu, perr := url.Parse(cfg.Proxy)
+		if perr != nil {
+			return nil, fmt.Errorf("parse proxy URL %q: %w", cfg.Proxy, perr)
+		}
+		client.Transport = &http.Transport{Proxy: http.ProxyURL(pu)}
+	}
+
 	r := &Runner{
-		cfg:         cfg,
-		client:      &http.Client{Timeout: cfg.Timeout},
-		extRegex:    extRegex,
-		includeMode: includeMode,
-		baseDomain:  cfg.NormalizeBaseDomain(),
-		outWriter:   os.Stdout,
+		cfg:            cfg,
+		client:         client,
+		extRegex:       extRegex,
+		includeMode:    includeMode,
+		currentPattern: cfg.URLPattern,
+		baseDomain:     baseDomainOf(cfg.URLPattern),
+		outWriter:      os.Stdout,
 	}
 
 	// Set up rate limiter using a ticker channel if requested.
@@ -90,10 +104,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
-		// Temporarily override URLPattern so all helper functions pick up the
-		// current domain without a full refactor.
-		r.cfg.URLPattern = domain
-		r.baseDomain = r.cfg.NormalizeBaseDomain()
+		// Point the run at the current domain without mutating shared Config.
+		r.currentPattern = domain
+		r.baseDomain = baseDomainOf(domain)
 		if err := r.runSingle(ctx); err != nil {
 			return err
 		}
@@ -154,10 +167,54 @@ dispatch:
 	return nil
 }
 
+// cdxFields returns the CDX fl= column list for the current output mode. JSON
+// mode needs the extra metadata columns; every other mode only prints the URL.
+func (r *Runner) cdxFields() string {
+	if r.cfg.JSON {
+		return "original,timestamp,statuscode,mimetype"
+	}
+	return "original"
+}
+
+// cdxFilters returns the CDX filter= params derived from --status/--mime.
+func (r *Runner) cdxFilters() []string {
+	var f []string
+	if r.cfg.Status != "" {
+		f = append(f, "statuscode:"+r.cfg.Status)
+	}
+	if r.cfg.Mime != "" {
+		f = append(f, "mimetype:"+r.cfg.Mime)
+	}
+	return f
+}
+
+// cdxURL builds a CDX API request URL. When numPages is true it asks only for
+// the page count; otherwise it requests a specific results page. from/to/status/
+// mime filters apply to both so the page count matches the fetched results.
+func (r *Runner) cdxURL(page int, numPages bool) string {
+	v := url.Values{}
+	v.Set("url", normalizeURLForCDX(r.currentPattern, r.cfg.Subs))
+	if numPages {
+		v.Set("showNumPages", "true")
+	} else {
+		v.Set("fl", r.cdxFields())
+		v.Set("collapse", "urlkey")
+		v.Set("page", strconv.Itoa(page))
+	}
+	if r.cfg.From != "" {
+		v.Set("from", r.cfg.From)
+	}
+	if r.cfg.To != "" {
+		v.Set("to", r.cfg.To)
+	}
+	for _, f := range r.cdxFilters() {
+		v.Add("filter", f)
+	}
+	return "https://web.archive.org/cdx/search/cdx?" + v.Encode()
+}
+
 func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
-	pagesURL := "https://web.archive.org/cdx/search/cdx?url=" +
-		url.QueryEscape(normalizeURLForCDX(r.cfg.URLPattern, r.cfg.Subs)) +
-		"&showNumPages=true"
+	pagesURL := r.cdxURL(0, true)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pagesURL, nil)
 	if err != nil {
@@ -225,10 +282,7 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 					}
 				}
 
-				pageURL := "https://web.archive.org/cdx/search/cdx?url=" +
-					url.QueryEscape(normalizeURLForCDX(r.cfg.URLPattern, r.cfg.Subs)) +
-					"&page=" + strconv.Itoa(p) +
-					"&fl=original&collapse=urlkey"
+				pageURL := r.cdxURL(p, false)
 
 				respP, ierr := r.fetchWithRetry(ctx, pageURL, pagesCompleted)
 				if ierr != nil || respP == nil {
@@ -348,8 +402,17 @@ func (r *Runner) processLine(line string) []string {
 		return nil
 	}
 
-	u, err := url.Parse(line)
-	path := line
+	// In JSON mode the CDX line carries several space-separated columns; the URL
+	// is the first. Filter on it and pass the whole record through for printJSON.
+	rawURL := line
+	if r.cfg.JSON {
+		if fields := strings.Fields(line); len(fields) > 0 {
+			rawURL = fields[0]
+		}
+	}
+
+	u, err := url.Parse(rawURL)
+	path := rawURL
 	if err == nil && u.Path != "" {
 		path = u.Path
 	}
@@ -363,6 +426,10 @@ func (r *Runner) processLine(line string) []string {
 		} else if !r.includeMode && match {
 			return nil
 		}
+	}
+
+	if r.cfg.JSON {
+		return []string{line}
 	}
 
 	if r.cfg.OnlyQuery {
@@ -413,6 +480,11 @@ func (r *Runner) startPrinter(resultsCh <-chan string, pagesCompleted *int32) *s
 		defer printWg.Done()
 		bufw := bufio.NewWriter(r.outWriter)
 
+		if r.cfg.JSON {
+			r.printJSON(bufw, resultsCh, pagesCompleted)
+			return
+		}
+
 		if r.cfg.Subs {
 			r.printSubdomains(bufw, resultsCh, pagesCompleted)
 			return
@@ -427,6 +499,55 @@ func (r *Runner) startPrinter(resultsCh <-chan string, pagesCompleted *int32) *s
 	}()
 
 	return &printWg
+}
+
+// jsonRecord is one JSONL output line. Empty metadata fields are omitted.
+type jsonRecord struct {
+	URL       string `json:"url"`
+	Timestamp string `json:"timestamp,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Mime      string `json:"mime,omitempty"`
+}
+
+// parseCDXRecord turns a CDX line (columns original,timestamp,statuscode,
+// mimetype) into a jsonRecord. Untrusted string fields are sanitized; CDX uses
+// "-" for a missing value, which is dropped. Returns ok=false for blank lines.
+func parseCDXRecord(line string) (jsonRecord, bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return jsonRecord{}, false
+	}
+	rec := jsonRecord{URL: sanitizeForTerminal(fields[0])}
+	get := func(i int) string {
+		if i < len(fields) && fields[i] != "-" {
+			return sanitizeForTerminal(fields[i])
+		}
+		return ""
+	}
+	rec.Timestamp = get(1)
+	rec.Status = get(2)
+	rec.Mime = get(3)
+	return rec, rec.URL != ""
+}
+
+func (r *Runner) printJSON(bufw *bufio.Writer, resultsCh <-chan string, pagesCompleted *int32) {
+	enc := json.NewEncoder(bufw)
+	enc.SetEscapeHTML(false)
+	seen := make(map[string]struct{})
+	for res := range resultsCh {
+		rec, ok := parseCDXRecord(res)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[rec.URL]; dup {
+			continue
+		}
+		seen[rec.URL] = struct{}{}
+		r.pbar.ClearLine()
+		enc.Encode(rec) // Encode appends a newline, giving JSONL output
+		r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
+	}
+	r.finishOutput(bufw)
 }
 
 func (r *Runner) printSubdomains(bufw *bufio.Writer, resultsCh <-chan string, pagesCompleted *int32) {

@@ -48,7 +48,16 @@ Common flags:
 - `-page-workers`: Number of concurrent CDX page fetchers (default `10`). Controls how many CDX pages are fetched in parallel.
 - `-extract-paths`: Instead of printing whole URLs, extract unique path segments and print each segment on its own line.
 - `-subs`: Print unique subdomains (requires a base domain/pattern). The tool derives a normalized base domain and prints discovered subdomains.
+- `-json`: Emit JSONL — one JSON object per line with `url`, `timestamp`, `status`, and `mime`. This is an output mode; it cannot be combined with `-only-query`, `-only-query-keys`, `-extract-paths`, or `-subs`.
+- `-stdin`: Read targets from stdin, one per line (lines starting with `#` are treated as comments). Each domain is processed sequentially.
+- `-from` / `-to`: Restrict results to a capture time window. Accepts a Wayback timestamp, `yyyy`, `yyyyMMdd`, or `yyyyMMddhhmmss` (e.g. `-from 2020 -to 2022`).
+- `-status`: CDX `statuscode` filter, applied server-side. Accepts a value or regex (e.g. `200`, `2..`, `(200|301)`).
+- `-mime`: CDX `mimetype` filter, applied server-side (e.g. `text/html`, `application/json`).
+- `-proxy`: Route all CDX requests through a proxy (`http://`, `https://`, or `socks5://`). If unset, the standard `HTTP_PROXY`/`HTTPS_PROXY` environment variables are honored. Useful for routing through Burp/mitmproxy or spreading requests across egress IPs to avoid rate limits.
+- `-rate`: Max CDX requests per second (default `0` = unlimited). Recommended `5`–`10` to avoid HTTP 429 rate limiting from the archive.
 - `-timeout`: HTTP client timeout in seconds (default `80`).
+
+Output modes (`-only-query`, `-only-query-keys`, `-extract-paths`, `-subs`, `-json`) are mutually exclusive — passing more than one is an error.
 
 Default excluded extensions (used when `-exclude-defaults` is set, or when `-exclude-ext` flag is present but empty):
 
@@ -109,6 +118,30 @@ Pipe raw URLs to another command or file (progress bar will render on `/dev/tty`
 
 ```bash
 gowaybackgo -u "example.com" > urls.txt
+```
+
+Emit structured JSONL with only successful HTML captures:
+
+```bash
+gowaybackgo -u "example.com" -json -status 200 -mime text/html
+```
+
+Restrict to a date range and save to a file:
+
+```bash
+gowaybackgo -u "example.com" -from 2020 -to 2022 -o urls.txt
+```
+
+Route through a local intercepting proxy (e.g. Burp):
+
+```bash
+gowaybackgo -u "example.com" -proxy http://127.0.0.1:8080
+```
+
+Feed a list of domains from stdin:
+
+```bash
+cat domains.txt | gowaybackgo -stdin -exclude-defaults
 ```
 
 ## Expected outputs and behavior

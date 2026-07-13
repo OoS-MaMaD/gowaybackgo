@@ -23,9 +23,15 @@ type Config struct {
 	PageWorkers     int
 	ExtractPaths    bool
 	Subs            bool
+	JSON            bool // emit one JSON object per line (JSONL) instead of plain text
 	Timeout         time.Duration
 	RateLimit       int // max CDX page requests per second (0 = unlimited)
 	Stdin           bool
+	From            string // CDX from= timestamp filter (yyyy[MMdd[hhmmss]])
+	To              string // CDX to= timestamp filter (yyyy[MMdd[hhmmss]])
+	Status          string // CDX statuscode filter (e.g. 200, 2.., (200|301))
+	Mime            string // CDX mimetype filter (e.g. text/html, application/json)
+	Proxy           string // HTTP/HTTPS/SOCKS5 proxy URL; empty falls back to env
 }
 
 const banner = `
@@ -62,6 +68,8 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  --no-query            Strip query strings from output URLs")
 	fmt.Fprintln(os.Stderr, "  --extract-paths       Print unique path segments (one per line)")
 	fmt.Fprintln(os.Stderr, "  --subs                Print unique subdomains of the target domain")
+	fmt.Fprintln(os.Stderr, "  --json                Emit JSONL: {\"url\",\"timestamp\",\"status\",\"mime\"}")
+	fmt.Fprintln(os.Stderr, "                          (output modes above are mutually exclusive)")
 	fmt.Fprintln(os.Stderr, "")
 
 	fmt.Fprintln(os.Stderr, "FILTERING")
@@ -70,6 +78,10 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "                          js css png jpg jpeg gif svg webp ico bmp tif tiff")
 	fmt.Fprintln(os.Stderr, "                          woff woff2 ttf eot mp4 mp3 wav avi mov mkv zip rar 7z pdf")
 	fmt.Fprintln(os.Stderr, "  --include-ext <exts>  Only include these extensions (overrides exclude)")
+	fmt.Fprintln(os.Stderr, "  --from <ts>           Only captures at/after this time (yyyy[MMdd[hhmmss]])")
+	fmt.Fprintln(os.Stderr, "  --to <ts>             Only captures at/before this time (yyyy[MMdd[hhmmss]])")
+	fmt.Fprintln(os.Stderr, "  --status <re>         CDX statuscode filter   e.g. 200  2..  (200|301)")
+	fmt.Fprintln(os.Stderr, "  --mime <re>           CDX mimetype filter     e.g. text/html  application/json")
 	fmt.Fprintln(os.Stderr, "")
 
 	fmt.Fprintln(os.Stderr, "PERFORMANCE")
@@ -78,6 +90,9 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  --page-workers <n>    Concurrent CDX page fetchers   (default: 10)")
 	fmt.Fprintln(os.Stderr, "  --workers <n>         Concurrent URL processors      (default: 20)")
 	fmt.Fprintln(os.Stderr, "  --timeout <sec>       HTTP timeout in seconds         (default: 80)")
+	fmt.Fprintln(os.Stderr, "  --proxy <url>         Route requests through a proxy")
+	fmt.Fprintln(os.Stderr, "                          http://host:port  https://...  socks5://host:port")
+	fmt.Fprintln(os.Stderr, "                          (falls back to HTTP_PROXY/HTTPS_PROXY env if unset)")
 	fmt.Fprintln(os.Stderr, "")
 
 	fmt.Fprintln(os.Stderr, "EXAMPLES")
@@ -87,6 +102,9 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --only-query-keys")
 	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com/api --include-ext json,xml")
 	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --rate 5 --page-workers 5")
+	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --json --status 200 --mime text/html")
+	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --from 2020 --to 2022 -o urls.txt")
+	fmt.Fprintln(os.Stderr, "  gowaybackgo -u example.com --proxy http://127.0.0.1:8080")
 	fmt.Fprintln(os.Stderr, "  cat domains.txt | gowaybackgo --stdin --exclude-defaults")
 	fmt.Fprintln(os.Stderr, "")
 }
@@ -110,6 +128,12 @@ func ParseConfig() (*Config, error) {
 	pageWorkers := flag.Int("page-workers", 10, "")
 	timeout := flag.Int("timeout", 80, "")
 	rateLimit := flag.Int("rate", 0, "")
+	jsonOut := flag.Bool("json", false, "")
+	from := flag.String("from", "", "")
+	to := flag.String("to", "", "")
+	status := flag.String("status", "", "")
+	mime := flag.String("mime", "", "")
+	proxy := flag.String("proxy", "", "")
 	flag.Parse()
 
 	cfg := &Config{
@@ -124,9 +148,19 @@ func ParseConfig() (*Config, error) {
 		PageWorkers:     *pageWorkers,
 		ExtractPaths:    *extractPaths,
 		Subs:            *subs,
+		JSON:            *jsonOut,
 		Timeout:         time.Duration(*timeout) * time.Second,
 		RateLimit:       *rateLimit,
 		Stdin:           *stdinFlag,
+		From:            strings.TrimSpace(*from),
+		To:              strings.TrimSpace(*to),
+		Status:          strings.TrimSpace(*status),
+		Mime:            strings.TrimSpace(*mime),
+		Proxy:           strings.TrimSpace(*proxy),
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 
 	if *stdinFlag {
@@ -172,9 +206,51 @@ func (c *Config) EffectiveExclude() (string, bool) {
 
 // NormalizeBaseDomain derives a clean domain for subdomain extraction.
 func (c *Config) NormalizeBaseDomain() string {
-	baseDomain := c.URLPattern
-	baseDomain = normalizeURLForCDX(baseDomain, false)
+	return baseDomainOf(c.URLPattern)
+}
+
+// baseDomainOf derives a clean base domain from a target pattern. Kept as a
+// standalone function so callers can normalize an arbitrary pattern (e.g. the
+// current --stdin domain) without mutating shared Config state.
+func baseDomainOf(pattern string) string {
+	baseDomain := normalizeURLForCDX(pattern, false)
 	baseDomain = strings.TrimPrefix(baseDomain, "*.")
 	baseDomain = strings.TrimSuffix(baseDomain, "*")
 	return strings.Trim(baseDomain, " .")
+}
+
+// validate rejects mutually exclusive output modes and warns about
+// combinations that are silently ignored, so users get a clear error up front
+// instead of surprising output.
+func (c *Config) validate() error {
+	type mode struct {
+		set  bool
+		flag string
+	}
+	exclusive := []mode{
+		{c.OnlyQuery, "--only-query"},
+		{c.OnlyQueryKeys, "--only-query-keys"},
+		{c.ExtractPaths, "--extract-paths"},
+		{c.Subs, "--subs"},
+		{c.JSON, "--json"},
+	}
+	var active []string
+	for _, m := range exclusive {
+		if m.set {
+			active = append(active, m.flag)
+		}
+	}
+	if len(active) > 1 {
+		return fmt.Errorf("only one output mode may be set, but got %s", strings.Join(active, ", "))
+	}
+
+	// --no-query is a transform on default output; it does nothing under the
+	// exclusive modes above. Warn rather than fail.
+	if c.NoQuery && len(active) == 1 {
+		fmt.Fprintf(os.Stderr, "⚠ WARNING: --no-query is ignored with %s\n", active[0])
+	}
+	if strings.TrimSpace(c.IncludeExt) != "" && strings.TrimSpace(c.ExcludeExt) != "" {
+		fmt.Fprintln(os.Stderr, "⚠ WARNING: --include-ext takes precedence; --exclude-ext is ignored")
+	}
+	return nil
 }

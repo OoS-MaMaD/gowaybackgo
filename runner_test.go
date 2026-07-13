@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"reflect"
 	"testing"
 )
@@ -96,6 +97,18 @@ func TestProcessLine(t *testing.T) {
 			line: "http://sub.example.com/app.js",
 			want: []string{"http://sub.example.com/app.js"},
 		},
+		{
+			name: "json mode passes full record through",
+			cfg:  &Config{JSON: true},
+			line: "http://example.com/p 20200101 200 text/html",
+			want: []string{"http://example.com/p 20200101 200 text/html"},
+		},
+		{
+			name: "json mode filters on url field",
+			cfg:  &Config{JSON: true, ExcludeDefaults: true},
+			line: "http://example.com/app.js 20200101 200 application/javascript",
+			want: nil,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -106,4 +119,109 @@ func TestProcessLine(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseCDXRecord(t *testing.T) {
+	tests := []struct {
+		name   string
+		line   string
+		want   jsonRecord
+		wantOK bool
+	}{
+		{"blank", "   ", jsonRecord{}, false},
+		{"url only", "http://x/a", jsonRecord{URL: "http://x/a"}, true},
+		{
+			"full record",
+			"http://x/a 20200101 200 text/html",
+			jsonRecord{URL: "http://x/a", Timestamp: "20200101", Status: "200", Mime: "text/html"},
+			true,
+		},
+		{
+			"missing fields are dashes",
+			"http://x/a - 200 -",
+			jsonRecord{URL: "http://x/a", Status: "200"},
+			true,
+		},
+		{
+			"control chars stripped from url",
+			"http://x/\x1b[31m 20200101 200 text/html",
+			jsonRecord{URL: "http://x/[31m", Timestamp: "20200101", Status: "200", Mime: "text/html"},
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseCDXRecord(tt.line)
+			if ok != tt.wantOK {
+				t.Fatalf("parseCDXRecord(%q) ok = %v, want %v", tt.line, ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("parseCDXRecord(%q) = %+v, want %+v", tt.line, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCDXURL(t *testing.T) {
+	r := &Runner{
+		cfg: &Config{
+			JSON:   true,
+			From:   "2020",
+			To:     "2022",
+			Status: "200",
+			Mime:   "text/html",
+		},
+		currentPattern: "https://example.com/api",
+	}
+
+	t.Run("page request", func(t *testing.T) {
+		u, err := url.Parse(r.cdxURL(3, false))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		q := u.Query()
+		checks := map[string]string{
+			"url":      "example.com/api*",
+			"fl":       "original,timestamp,statuscode,mimetype",
+			"collapse": "urlkey",
+			"page":     "3",
+			"from":     "2020",
+			"to":       "2022",
+		}
+		for k, want := range checks {
+			if got := q.Get(k); got != want {
+				t.Errorf("query %q = %q, want %q", k, got, want)
+			}
+		}
+		filters := q["filter"]
+		wantFilters := map[string]bool{"statuscode:200": false, "mimetype:text/html": false}
+		for _, f := range filters {
+			if _, ok := wantFilters[f]; ok {
+				wantFilters[f] = true
+			}
+		}
+		for f, seen := range wantFilters {
+			if !seen {
+				t.Errorf("missing filter %q in %v", f, filters)
+			}
+		}
+	})
+
+	t.Run("page-count request omits paging fields", func(t *testing.T) {
+		u, err := url.Parse(r.cdxURL(0, true))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		q := u.Query()
+		if q.Get("showNumPages") != "true" {
+			t.Errorf("showNumPages = %q, want true", q.Get("showNumPages"))
+		}
+		if q.Get("page") != "" || q.Get("fl") != "" {
+			t.Errorf("page-count request should not set page/fl, got page=%q fl=%q", q.Get("page"), q.Get("fl"))
+		}
+		// Filters still apply so the count matches the fetched results.
+		if q.Get("from") != "2020" || len(q["filter"]) != 2 {
+			t.Errorf("page-count request should keep from/filter params, got from=%q filters=%v", q.Get("from"), q["filter"])
+		}
+	})
 }
