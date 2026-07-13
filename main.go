@@ -38,17 +38,6 @@ func main() {
 	}
 }
 
-// normalizeURL ensures the pattern ends with * if missing
-func normalizeURL(u string) string {
-	u = strings.TrimSpace(u)
-	u = strings.TrimPrefix(u, "http://")
-	u = strings.TrimPrefix(u, "https://")
-	if !strings.Contains(u, "*") {
-		u += "*"
-	}
-	return u
-}
-
 // normalizeURLForCDX prepares a URL pattern for CDX queries.
 // If subs==true we return a leading-wildcard base like "*.example.com" to get
 // subdomain captures. Otherwise we behave like normalizeURL (append a trailing

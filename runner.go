@@ -23,6 +23,33 @@ const maxRetries = 3
 // the default Go client UA, so identify the tool explicitly.
 const userAgent = "gowaybackgo (+github.com/OoS-MaMaD/gowaybackgo)"
 
+const (
+	colorRed    = "\033[31m"
+	colorYellow = "\033[33m"
+)
+
+// sleepCtx waits for d or until ctx is cancelled. Returns false if cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// logStatus shows a transient message on the progress bar when one exists,
+// otherwise writes it to stderr. This lets the retry path report progress both
+// during page fetching (bar present) and during the page-count request, which
+// runs before the bar is created.
+func (r *Runner) logStatus(msg, color string) {
+	if r.pbar != nil {
+		r.pbar.Log(msg, color)
+		return
+	}
+	fmt.Fprintln(os.Stderr, msg)
+}
+
 // Runner encapsulates the orchestration needed to fetch CDX pages and process results.
 type Runner struct {
 	cfg            *Config
@@ -39,8 +66,7 @@ type Runner struct {
 
 // NewRunner builds a Runner with compiled filters and output writers prepared.
 func NewRunner(cfg *Config) (*Runner, error) {
-	effectiveExclude, _ := cfg.EffectiveExclude()
-	extRegex, includeMode, err := CompileExtRegex(cfg.IncludeExt, effectiveExclude)
+	extRegex, includeMode, err := CompileExtRegex(cfg.IncludeExt, cfg.EffectiveExclude())
 	if err != nil {
 		return nil, fmt.Errorf("compile extension regex: %w", err)
 	}
@@ -99,6 +125,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	// which silently dropped their output.
 	defer r.closeOutput()
 
+	var lastErr error
+	failed := 0
 	for _, domain := range domains {
 		// Stop launching new domains once cancelled.
 		if ctx.Err() != nil {
@@ -108,8 +136,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.currentPattern = domain
 		r.baseDomain = baseDomainOf(domain)
 		if err := r.runSingle(ctx); err != nil {
-			return err
+			if ctx.Err() != nil {
+				break // cancelled mid-domain: stop cleanly
+			}
+			// One domain failing shouldn't abandon the rest of a --stdin batch.
+			fmt.Fprintf(os.Stderr, "❌ ERROR processing %q: %v\n", domain, err)
+			lastErr = err
+			failed++
 		}
+	}
+	// Surface an error (non-zero exit) only when every domain failed; a partial
+	// batch still exits 0 so the domains that succeeded are honored.
+	if lastErr != nil && failed == len(domains) {
+		return lastErr
 	}
 	return nil
 }
@@ -214,23 +253,13 @@ func (r *Runner) cdxURL(page int, numPages bool) string {
 }
 
 func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
-	pagesURL := r.cdxURL(0, true)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pagesURL, nil)
-	if err != nil {
-		return 0, fmt.Errorf("build page count request: %w", err)
-	}
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := r.client.Do(req)
+	// Retry like page fetches do; a transient 429/5xx on the count request must
+	// not abort the domain. r.pbar is nil here, so retry messages go to stderr.
+	resp, err := r.fetchWithRetry(ctx, r.cdxURL(0, true), nil)
 	if err != nil {
 		return 0, fmt.Errorf("fetch page count: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("CDX page count returned HTTP %d", resp.StatusCode)
-	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	numStr := ""
@@ -286,8 +315,7 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 
 				respP, ierr := r.fetchWithRetry(ctx, pageURL, pagesCompleted)
 				if ierr != nil || respP == nil {
-					msg := fmt.Sprintf("❌ ERROR fetching CDX page %d: %v", p, ierr)
-					r.pbar.Log(msg, "\033[31m")
+					r.logStatus(fmt.Sprintf("❌ ERROR fetching CDX page %d: %v", p, ierr), colorRed)
 					atomic.AddInt32(pagesCompleted, 1)
 					r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 					continue
@@ -302,8 +330,7 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 					}
 				}
 				if err := sc.Err(); err != nil {
-					msg := fmt.Sprintf("⚠ WARNING: error reading CDX page %d: %v", p, err)
-					r.pbar.Log(msg, "\033[33m")
+					r.logStatus(fmt.Sprintf("⚠ WARNING: error reading CDX page %d: %v", p, err), colorYellow)
 					r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 				}
 				respP.Body.Close()
@@ -334,40 +361,39 @@ func (r *Runner) fetchWithRetry(ctx context.Context, pageURL string, pagesComple
 		req.Header.Set("User-Agent", userAgent)
 
 		resp, err := r.client.Do(req)
-		if err != nil {
+		switch {
+		case err != nil:
 			lastErr = err
-		} else if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		case resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices:
 			return resp, nil
-		} else {
-			// Treat non-2xx as a retryable error; surface the status code clearly.
+		default:
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			resp.Body.Close()
 
-			// For 429 (rate limited) or 5xx use a longer back-off.
+			// 429 (rate limited) and 5xx are transient: long back-off then retry.
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				backoff := time.Duration(attempt*attempt) * time.Second // 1s, 4s, 9s
-				msg := fmt.Sprintf("⚠ HTTP %d on page fetch; backing off %s (attempt %d/%d)",
-					resp.StatusCode, backoff, attempt, maxRetries)
-				r.pbar.Log(msg, "\033[33m")
-				select {
-				case <-time.After(backoff):
-				case <-ctx.Done():
+				r.logStatus(fmt.Sprintf("⚠ HTTP %d on page fetch; backing off %s (attempt %d/%d)",
+					resp.StatusCode, backoff, attempt, maxRetries), colorYellow)
+				if !sleepCtx(ctx, backoff) {
 					return nil, ctx.Err()
 				}
 				continue
+			}
+			// Other 4xx won't change on retry — fail fast.
+			if resp.StatusCode >= 400 {
+				return nil, lastErr
 			}
 		}
 
 		if attempt < maxRetries {
 			backoff := time.Duration(attempt) * time.Second
-			msg := fmt.Sprintf("⚠ retrying page fetch (attempt %d/%d): %v", attempt, maxRetries, lastErr)
-			r.pbar.Log(msg, "\033[33m")
-			if pagesCompleted != nil {
+			r.logStatus(fmt.Sprintf("⚠ retrying page fetch (attempt %d/%d): %v",
+				attempt, maxRetries, lastErr), colorYellow)
+			if pagesCompleted != nil && r.pbar != nil {
 				r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 			}
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
+			if !sleepCtx(ctx, backoff) {
 				return nil, ctx.Err()
 			}
 		}
@@ -623,9 +649,12 @@ func (r *Runner) writeWithProgress(bufw *bufio.Writer, value string, pagesComple
 
 // finishOutput flushes the per-domain buffered writer. The underlying file is
 // left open so subsequent domains can keep appending; it is closed once by
-// closeOutput after the whole run completes.
+// closeOutput after the whole run completes. A flush error (e.g. disk full or a
+// closed pipe) is surfaced to stderr rather than silently dropped.
 func (r *Runner) finishOutput(bufw *bufio.Writer) {
-	bufw.Flush()
+	if err := bufw.Flush(); err != nil {
+		fmt.Fprintln(os.Stderr, "⚠ WARNING: error writing output:", err)
+	}
 }
 
 // closeOutput closes the output file once, at the end of the run, and reports

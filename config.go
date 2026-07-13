@@ -25,13 +25,17 @@ type Config struct {
 	Subs            bool
 	JSON            bool // emit one JSON object per line (JSONL) instead of plain text
 	Timeout         time.Duration
-	RateLimit       int // max CDX page requests per second (0 = unlimited)
-	Stdin           bool
+	RateLimit       int    // max CDX page requests per second (0 = unlimited)
 	From            string // CDX from= timestamp filter (yyyy[MMdd[hhmmss]])
 	To              string // CDX to= timestamp filter (yyyy[MMdd[hhmmss]])
 	Status          string // CDX statuscode filter (e.g. 200, 2.., (200|301))
 	Mime            string // CDX mimetype filter (e.g. text/html, application/json)
 	Proxy           string // HTTP/HTTPS/SOCKS5 proxy URL; empty falls back to env
+
+	// excludeFlagSet records whether --exclude-ext was passed on the command
+	// line, captured at parse time so EffectiveExclude does not depend on the
+	// global flag package state at call time.
+	excludeFlagSet bool
 }
 
 const banner = `
@@ -151,13 +155,17 @@ func ParseConfig() (*Config, error) {
 		JSON:            *jsonOut,
 		Timeout:         time.Duration(*timeout) * time.Second,
 		RateLimit:       *rateLimit,
-		Stdin:           *stdinFlag,
 		From:            strings.TrimSpace(*from),
 		To:              strings.TrimSpace(*to),
 		Status:          strings.TrimSpace(*status),
 		Mime:            strings.TrimSpace(*mime),
 		Proxy:           strings.TrimSpace(*proxy),
 	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "exclude-ext" {
+			cfg.excludeFlagSet = true
+		}
+	})
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -183,25 +191,21 @@ func ParseConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// EffectiveExclude determines the active exclusion list following user flags.
-func (c *Config) EffectiveExclude() (string, bool) {
-	var effectiveExclude string
-	excludeProvided := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "exclude-ext" {
-			excludeProvided = true
-		}
-	})
-	if c.ExcludeDefaults {
-		effectiveExclude = defaultExclude
-	} else if !excludeProvided {
-		effectiveExclude = ""
-	} else if c.ExcludeExt == "" {
-		effectiveExclude = defaultExclude
-	} else {
-		effectiveExclude = c.ExcludeExt
+// EffectiveExclude returns the active exclusion list following user flags:
+// --exclude-defaults (or --exclude-ext with an empty value) selects the default
+// list; --exclude-ext with a value selects that value; otherwise nothing is
+// excluded.
+func (c *Config) EffectiveExclude() string {
+	switch {
+	case c.ExcludeDefaults:
+		return defaultExclude
+	case !c.excludeFlagSet:
+		return ""
+	case c.ExcludeExt == "":
+		return defaultExclude
+	default:
+		return c.ExcludeExt
 	}
-	return effectiveExclude, excludeProvided
 }
 
 // NormalizeBaseDomain derives a clean domain for subdomain extraction.

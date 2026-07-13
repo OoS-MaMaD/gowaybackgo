@@ -30,9 +30,7 @@ func CompileExtRegex(includeCSV, excludeCSV string) (*regexp.Regexp, bool, error
 	if len(parts) == 0 {
 		return nil, includeMode, nil
 	}
-	reStr := `(?i)\.( ` + strings.Join(parts, "|") + `)$`
-	reStr = strings.ReplaceAll(reStr, "( ", "(")
-	re, err := regexp.Compile(reStr)
+	re, err := regexp.Compile(`(?i)\.(` + strings.Join(parts, "|") + `)$`)
 	return re, includeMode, err
 }
 

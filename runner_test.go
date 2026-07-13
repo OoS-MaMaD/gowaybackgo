@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newTestRunner builds a Runner wired only with the fields processLine reads,
 // compiling the extension regex the same way NewRunner does.
 func newTestRunner(t *testing.T, cfg *Config) *Runner {
 	t.Helper()
-	effectiveExclude, _ := cfg.EffectiveExclude()
-	re, includeMode, err := CompileExtRegex(cfg.IncludeExt, effectiveExclude)
+	re, includeMode, err := CompileExtRegex(cfg.IncludeExt, cfg.EffectiveExclude())
 	if err != nil {
 		t.Fatalf("CompileExtRegex: %v", err)
 	}
@@ -224,4 +229,63 @@ func TestCDXURL(t *testing.T) {
 			t.Errorf("page-count request should keep from/filter params, got from=%q filters=%v", q.Get("from"), q["filter"])
 		}
 	})
+}
+
+func TestFetchWithRetry(t *testing.T) {
+	t.Run("success returns response without retry and sends UA", func(t *testing.T) {
+		var hits int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			if req.Header.Get("User-Agent") != userAgent {
+				t.Errorf("User-Agent = %q, want %q", req.Header.Get("User-Agent"), userAgent)
+			}
+			fmt.Fprintln(w, "ok")
+		}))
+		defer srv.Close()
+		r := &Runner{client: srv.Client()}
+		resp, err := r.fetchWithRetry(context.Background(), srv.URL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp.Body.Close()
+		if got := atomic.LoadInt32(&hits); got != 1 {
+			t.Errorf("hits = %d, want 1", got)
+		}
+	})
+
+	t.Run("404 fails fast without retrying", func(t *testing.T) {
+		var hits int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer srv.Close()
+		r := &Runner{client: srv.Client()}
+		if _, err := r.fetchWithRetry(context.Background(), srv.URL, nil); err == nil {
+			t.Fatal("expected an error for HTTP 404")
+		}
+		if got := atomic.LoadInt32(&hits); got != 1 {
+			t.Errorf("hits = %d, want 1 (a 404 must not be retried)", got)
+		}
+	})
+
+	t.Run("already-cancelled context returns immediately", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := &Runner{client: http.DefaultClient}
+		if _, err := r.fetchWithRetry(ctx, "http://example.invalid", nil); err == nil {
+			t.Fatal("expected an error on a cancelled context")
+		}
+	})
+}
+
+func TestSleepCtx(t *testing.T) {
+	if !sleepCtx(context.Background(), time.Millisecond) {
+		t.Error("sleepCtx should return true after the delay elapses")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if sleepCtx(ctx, time.Hour) {
+		t.Error("sleepCtx should return false when the context is cancelled")
+	}
 }
