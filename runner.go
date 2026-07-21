@@ -593,6 +593,7 @@ func (r *Runner) printJSON(bufw *bufio.Writer, resultsCh <-chan string, pagesCom
 		seen[rec.URL] = struct{}{}
 		r.pbar.ClearLine()
 		enc.Encode(rec) // Encode appends a newline, giving JSONL output
+		bufw.Flush()    // stream each record live rather than buffering
 		r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 	}
 	r.finishOutput(bufw)
@@ -666,6 +667,10 @@ func (r *Runner) printDefault(bufw *bufio.Writer, resultsCh <-chan string, pages
 func (r *Runner) writeWithProgress(bufw *bufio.Writer, value string, pagesCompleted *int32) {
 	r.pbar.ClearLine()
 	fmt.Fprintln(bufw, sanitizeForTerminal(value))
+	// Flush each result so output streams live (pipeable, watchable) instead of
+	// sitting in the buffer until it fills or the run ends. A persistent write
+	// error is surfaced once by finishOutput; a per-line error is ignored here.
+	bufw.Flush()
 	r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 }
 

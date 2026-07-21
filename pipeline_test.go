@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -196,5 +197,64 @@ func TestPipelineCancelMidFlight(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after cancellation — possible deadlock")
+	}
+}
+
+// streamWriter forwards each Write to a channel so a test can observe output as
+// it is produced, rather than only after the run completes.
+type streamWriter struct{ ch chan string }
+
+func (w *streamWriter) Write(p []byte) (int, error) {
+	w.ch <- string(p)
+	return len(p), nil
+}
+
+// TestPipelineStreamsOutput proves results are flushed as they are found: page 0
+// returns a URL immediately while page 1 blocks, and the early result must reach
+// the writer before the run finishes. With buffered (non-streaming) output the
+// single short line would sit in the buffer and never arrive in time.
+func TestPipelineStreamsOutput(t *testing.T) {
+	var once sync.Once
+	release := make(chan struct{})
+	rel := func() { once.Do(func() { close(release) }) }
+	defer rel() // free the blocked handler on any exit path
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		q := req.URL.Query()
+		if q.Get("showNumPages") == "true" {
+			fmt.Fprintln(w, "2")
+			return
+		}
+		switch q.Get("page") {
+		case "0":
+			fmt.Fprintln(w, "http://example.com/early")
+		case "1":
+			<-release // hold page 1 until the test has seen page 0's output
+			fmt.Fprintln(w, "http://example.com/late")
+		}
+	}))
+	defer srv.Close()
+
+	sw := &streamWriter{ch: make(chan string, 16)}
+	r := newPipelineRunner(t, srv, &Config{PageWorkers: 1, Workers: 1}, nil)
+	r.outWriter = sw
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background()) }()
+
+	select {
+	case got := <-sw.ch:
+		if !strings.Contains(got, "early") {
+			t.Fatalf("first streamed chunk = %q, want the early URL", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no output streamed before the run finished — output is being buffered")
+	}
+
+	rel() // let page 1 complete
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not complete")
 	}
 }
