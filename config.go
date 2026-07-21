@@ -26,11 +26,16 @@ type Config struct {
 	JSON            bool // emit one JSON object per line (JSONL) instead of plain text
 	Timeout         time.Duration
 	RateLimit       int    // max CDX page requests per second (0 = unlimited)
+	Retries         int    // max attempts per CDX request
 	From            string // CDX from= timestamp filter (yyyy[MMdd[hhmmss]])
 	To              string // CDX to= timestamp filter (yyyy[MMdd[hhmmss]])
 	Status          string // CDX statuscode filter (e.g. 200, 2.., (200|301))
 	Mime            string // CDX mimetype filter (e.g. text/html, application/json)
 	Proxy           string // HTTP/HTTPS/SOCKS5 proxy URL; empty falls back to env
+	ListFile        string // read targets from this file (one per line)
+	Silent          bool   // results only: no banner, progress, or info/warn logs
+	Stats           bool   // periodic progress stats on stderr
+	NoColor         bool   // disable ANSI color everywhere
 
 	// excludeFlagSet records whether --exclude-ext was passed on the command
 	// line, captured at parse time so EffectiveExclude does not depend on the
@@ -91,15 +96,16 @@ func printUsage() {
 	row("-u <pattern>", "Target URL or domain pattern")
 	cont("e.g.  example.com   example.com/api/v1   *.example.com")
 	row("--stdin", "Read targets from stdin (one per line, # = comment)")
+	row("-l, --list <file>", "Read targets from a file (one per line)")
 
 	head("OUTPUT  (modes are mutually exclusive)")
-	row("-o <file>", "Write results to file (also prints to stdout)")
+	row("-o, --output <file>", "Write results to file (also prints to stdout)")
 	row("--only-query", "Print full query strings only    e.g. foo=1&bar=2")
 	row("--only-query-keys", "Print query parameter keys only  e.g. foo, bar")
 	row("--no-query", "Strip query strings from output URLs")
 	row("--extract-paths", "Print unique path segments (one per line)")
 	row("--subs", "Print unique subdomains of the target domain")
-	row("--json", `Emit JSONL: {"url","timestamp","status","mime"}`)
+	row("--json, --jsonl", `Emit JSONL: {"url","timestamp","status","mime"}`)
 
 	head("FILTERING")
 	row("--exclude-ext <exts>", "Comma-separated extensions to exclude (e.g. js,css,png)")
@@ -114,13 +120,19 @@ func printUsage() {
 	row("--mime <re>", "CDX mimetype filter     e.g. text/html  application/json")
 
 	head("PERFORMANCE")
-	row("--rate <n>", "Max CDX requests/sec (default: 0 = unlimited)")
+	row("-rl, --rate <n>", "Max CDX requests/sec (default: 0 = unlimited)")
 	cont("recommended 5-10 to avoid hitting rate limits")
 	row("--page-workers <n>", "Concurrent CDX page fetchers   (default: 10)")
-	row("--workers <n>", "Concurrent URL processors      (default: 20)")
+	row("-t, --workers <n>", "Concurrent URL processors      (default: 20)")
 	row("--timeout <sec>", "HTTP timeout in seconds        (default: 80)")
+	row("--retries <n>", "Attempts per CDX request       (default: 3)")
 	row("--proxy <url>", "Route via http/https/socks5 proxy")
 	cont("falls back to HTTP_PROXY/HTTPS_PROXY env if unset")
+
+	head("OUTPUT CONTROL")
+	row("--silent", "Only print results (no banner, progress, or logs)")
+	row("--stats", "Print periodic progress stats to stderr")
+	row("--nc, --no-color", "Disable ANSI color")
 
 	head("MISC")
 	row("--version", "Print version and exit")
@@ -143,7 +155,10 @@ func ParseConfig() (*Config, error) {
 
 	urlFlag := flag.String("u", "", "")
 	stdinFlag := flag.Bool("stdin", false, "")
+	listFile := flag.String("list", "", "")
+	flag.StringVar(listFile, "l", "", "") // alias
 	outputFile := flag.String("o", "", "")
+	flag.StringVar(outputFile, "output", "", "") // alias
 	onlyQuery := flag.Bool("only-query", false, "")
 	onlyQueryKeys := flag.Bool("only-query-keys", false, "")
 	noQuery := flag.Bool("no-query", false, "")
@@ -151,17 +166,26 @@ func ParseConfig() (*Config, error) {
 	excludeDefaults := flag.Bool("exclude-defaults", false, "")
 	includeExt := flag.String("include-ext", "", "")
 	workers := flag.Int("workers", 20, "")
+	flag.IntVar(workers, "t", 20, "") // alias (PD-style threads)
 	extractPaths := flag.Bool("extract-paths", false, "")
 	subs := flag.Bool("subs", false, "")
 	pageWorkers := flag.Int("page-workers", 10, "")
 	timeout := flag.Int("timeout", 80, "")
 	rateLimit := flag.Int("rate", 0, "")
+	flag.IntVar(rateLimit, "rl", 0, "")         // alias
+	flag.IntVar(rateLimit, "rate-limit", 0, "") // alias
+	retries := flag.Int("retries", 3, "")
 	jsonOut := flag.Bool("json", false, "")
+	flag.BoolVar(jsonOut, "jsonl", false, "") // alias
 	from := flag.String("from", "", "")
 	to := flag.String("to", "", "")
 	status := flag.String("status", "", "")
 	mime := flag.String("mime", "", "")
 	proxy := flag.String("proxy", "", "")
+	silent := flag.Bool("silent", false, "")
+	stats := flag.Bool("stats", false, "")
+	noColor := flag.Bool("nc", false, "")
+	flag.BoolVar(noColor, "no-color", false, "") // alias
 	versionFlag := flag.Bool("version", false, "")
 	flag.Parse()
 
@@ -185,11 +209,16 @@ func ParseConfig() (*Config, error) {
 		JSON:            *jsonOut,
 		Timeout:         time.Duration(*timeout) * time.Second,
 		RateLimit:       *rateLimit,
+		Retries:         *retries,
 		From:            strings.TrimSpace(*from),
 		To:              strings.TrimSpace(*to),
 		Status:          strings.TrimSpace(*status),
 		Mime:            strings.TrimSpace(*mime),
 		Proxy:           strings.TrimSpace(*proxy),
+		ListFile:        strings.TrimSpace(*listFile),
+		Silent:          *silent,
+		Stats:           *stats,
+		NoColor:         *noColor,
 	}
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "exclude-ext" {
@@ -201,23 +230,38 @@ func ParseConfig() (*Config, error) {
 		return nil, err
 	}
 
-	if *stdinFlag {
-		domains, err := readStdin()
+	// Target source, in precedence order: stdin, --list <file>, then -u.
+	switch {
+	case *stdinFlag:
+		domains, err := readTargets(os.Stdin)
 		if err != nil {
 			return nil, fmt.Errorf("read stdin: %w", err)
 		}
 		if len(domains) == 0 {
-			return nil, fmt.Errorf("no domains provided via stdin")
+			return nil, fmt.Errorf("no targets provided via stdin")
 		}
 		cfg.URLList = domains
 		cfg.URLPattern = domains[0]
-		return cfg, nil
+	case cfg.ListFile != "":
+		f, err := os.Open(cfg.ListFile)
+		if err != nil {
+			return nil, fmt.Errorf("open list file: %w", err)
+		}
+		defer f.Close()
+		domains, err := readTargets(f)
+		if err != nil {
+			return nil, fmt.Errorf("read list file: %w", err)
+		}
+		if len(domains) == 0 {
+			return nil, fmt.Errorf("no targets found in %s", cfg.ListFile)
+		}
+		cfg.URLList = domains
+		cfg.URLPattern = domains[0]
+	case *urlFlag != "":
+		cfg.URLPattern = *urlFlag
+	default:
+		return nil, fmt.Errorf("-u <url> is required (or use --stdin / --list <file>)")
 	}
-
-	if *urlFlag == "" {
-		return nil, fmt.Errorf("-u <url> is required (or use --stdin)")
-	}
-	cfg.URLPattern = *urlFlag
 	return cfg, nil
 }
 
@@ -291,6 +335,9 @@ func (c *Config) validate() error {
 	}
 	if c.RateLimit < 0 {
 		return fmt.Errorf("--rate must be >= 0 (0 = unlimited), got %d", c.RateLimit)
+	}
+	if c.Retries < 1 {
+		return fmt.Errorf("--retries must be >= 1, got %d", c.Retries)
 	}
 
 	// --no-query is a transform on default output; it does nothing under the

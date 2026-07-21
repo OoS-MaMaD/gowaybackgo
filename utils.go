@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"os"
+	"io"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -62,11 +62,11 @@ func sanitizeForTerminal(s string) string {
 	return b.String()
 }
 
-// readStdin reads non-empty lines from stdin and returns them as a slice.
-// Used by --stdin mode to pipe in a list of target domains.
-func readStdin() ([]string, error) {
+// readTargets reads non-empty, non-comment lines from r and returns them.
+// Used by --stdin and --list to gather target domains.
+func readTargets(r io.Reader) ([]string, error) {
 	var lines []string
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())

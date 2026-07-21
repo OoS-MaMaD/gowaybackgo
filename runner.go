@@ -17,7 +17,8 @@ import (
 	"time"
 )
 
-const maxRetries = 3
+// statsInterval is how often --stats prints a progress line.
+const statsInterval = 5 * time.Second
 
 // userAgent is sent on every CDX request. web.archive.org throttles or blocks
 // the default Go client UA, so identify the tool explicitly.
@@ -42,16 +43,17 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// logStatus shows a transient message on the progress bar when one exists,
-// otherwise writes it to stderr. This lets the retry path report progress both
-// during page fetching (bar present) and during the page-count request, which
-// runs before the bar is created.
-func (r *Runner) logStatus(msg, color string) {
-	if r.pbar != nil {
-		r.pbar.Log(msg, color)
+// notify surfaces a transient message. When an interactive progress bar is
+// active it shows on the bar's status line; otherwise it goes to the leveled
+// logger (which honors --silent). This keeps the pretty on-bar status for
+// interactive runs and clean [WRN]/[ERR] lines when piped or silent.
+func (r *Runner) notify(level logLevel, format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	if level != levelError && r.pbar != nil && r.pbar.active() {
+		r.pbar.Log(msg, levelColor(level))
 		return
 	}
-	fmt.Fprintln(os.Stderr, msg)
+	r.log.emit(level, "%s", msg)
 }
 
 // Runner encapsulates the orchestration needed to fetch CDX pages and process results.
@@ -59,6 +61,8 @@ type Runner struct {
 	cfg            *Config
 	client         *http.Client
 	baseURL        string // CDX endpoint; overridable in tests
+	log            *logger
+	color          bool // ANSI color enabled for progress/logs
 	extRegex       *regexp.Regexp
 	includeMode    bool
 	currentPattern string // target currently being processed (per --stdin domain)
@@ -66,6 +70,7 @@ type Runner struct {
 	outFile        *os.File
 	outWriter      io.Writer
 	pbar           *PBar
+	found          int64            // results emitted for the current target (atomic)
 	rateLimiter    <-chan time.Time // nil when no rate limiting
 }
 
@@ -87,10 +92,16 @@ func NewRunner(cfg *Config) (*Runner, error) {
 		client.Transport = &http.Transport{Proxy: http.ProxyURL(pu)}
 	}
 
+	// Bar renders to /dev/tty (always a terminal), so its color depends only on
+	// NO_COLOR/--nc. Logs go to stderr, so they additionally require stderr to be
+	// a terminal.
+	noColor := cfg.NoColor || os.Getenv("NO_COLOR") != ""
 	r := &Runner{
 		cfg:            cfg,
 		client:         client,
 		baseURL:        cdxBaseURL,
+		log:            newLogger(cfg.Silent, !noColor && isTerminal(os.Stderr.Fd())),
+		color:          !noColor,
 		extRegex:       extRegex,
 		includeMode:    includeMode,
 		currentPattern: cfg.URLPattern,
@@ -151,7 +162,7 @@ func (r *Runner) Run(ctx context.Context) error {
 				break // cancelled mid-domain: stop cleanly
 			}
 			// One domain failing shouldn't abandon the rest of a --stdin batch.
-			fmt.Fprintf(os.Stderr, "❌ ERROR processing %q: %v\n", domain, err)
+			r.log.errf("processing %q: %v", domain, err)
 			lastErr = err
 			failed++
 		}
@@ -166,8 +177,9 @@ func (r *Runner) Run(ctx context.Context) error {
 
 func (r *Runner) runSingle(ctx context.Context) error {
 	// Reset so the page-count phase (before the bar exists) logs to stderr rather
-	// than through a previous domain's finished bar.
+	// than through a previous domain's finished bar. found is per-target.
 	r.pbar = nil
+	atomic.StoreInt64(&r.found, 0)
 
 	pages, err := r.fetchPageCount(ctx)
 	if err != nil {
@@ -175,11 +187,12 @@ func (r *Runner) runSingle(ctx context.Context) error {
 	}
 
 	if pages <= 0 {
-		fmt.Fprintln(os.Stderr, "No pages reported by CDX; nothing to do.")
+		r.log.info("no pages reported by CDX for %s; nothing to do", r.currentPattern)
 		return nil
 	}
 
-	r.pbar = NewPBar(pages)
+	// The bar is for interactive runs; --silent and --stats suppress it.
+	r.pbar = NewPBar(pages, !r.cfg.Silent && !r.cfg.Stats, r.color)
 	r.pbar.Render(0)
 
 	// Clamp defensively; validate() already rejects < 1, but this keeps a
@@ -205,6 +218,11 @@ func (r *Runner) runSingle(ctx context.Context) error {
 	workerWg := r.startWorkers(jobs, resultsCh)
 	printWg := r.startPrinter(resultsCh, &pagesCompleted)
 
+	// --stats prints periodic progress to stderr; stop it when the run ends.
+	if r.cfg.Stats && !r.cfg.Silent {
+		defer r.startStats(ctx, pages, &pagesCompleted)()
+	}
+
 	// Dispatch page numbers, but stop early if the run is cancelled. Without the
 	// ctx.Done() case, a cancellation that drains all fetchers would leave this
 	// send blocking forever once pageJobs fills, deadlocking shutdown.
@@ -226,6 +244,32 @@ dispatch:
 
 	r.pbar.Finish()
 	return nil
+}
+
+// startStats launches a goroutine that periodically reports progress on stderr
+// (results→stdout stay clean). It returns a stop function; call it when the run
+// ends. Used for --stats, typically when the interactive bar is not shown.
+func (r *Runner) startStats(ctx context.Context, pages int, pagesCompleted *int32) func() {
+	stop := make(chan struct{})
+	start := time.Now()
+	go func() {
+		t := time.NewTicker(statsInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				r.log.info("progress: %d/%d pages, %d found, %s elapsed",
+					atomic.LoadInt32(pagesCompleted), pages,
+					atomic.LoadInt64(&r.found), formatDuration(time.Since(start)))
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(stop) }) }
 }
 
 // cdxFields returns the CDX fl= column list for the current output mode. JSON
@@ -301,7 +345,7 @@ func (r *Runner) fetchPageCount(ctx context.Context) (int, error) {
 	}
 	pages, err := strconv.Atoi(numStr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "⚠ WARNING: could not parse page count (", sanitizeForTerminal(numStr), "), defaulting to 1 page")
+		r.log.warn("could not parse page count (%s), defaulting to 1 page", sanitizeForTerminal(numStr))
 		return 1, nil
 	}
 	return pages, nil
@@ -337,7 +381,7 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 
 				respP, ierr := r.fetchWithRetry(ctx, pageURL, pagesCompleted)
 				if ierr != nil || respP == nil {
-					r.logStatus(fmt.Sprintf("❌ ERROR fetching CDX page %d: %v", p, ierr), colorRed)
+					r.notify(levelError, "fetching CDX page %d: %v", p, ierr)
 					atomic.AddInt32(pagesCompleted, 1)
 					r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 					continue
@@ -352,7 +396,7 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 					}
 				}
 				if err := sc.Err(); err != nil {
-					r.logStatus(fmt.Sprintf("⚠ WARNING: error reading CDX page %d: %v", p, err), colorYellow)
+					r.notify(levelWarn, "error reading CDX page %d: %v", p, err)
 					r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 				}
 				respP.Body.Close()
@@ -364,11 +408,15 @@ func (r *Runner) startPageFetchers(ctx context.Context, pageJobs <-chan int, job
 	return &fetchWg
 }
 
-// fetchWithRetry attempts up to maxRetries fetches with exponential back-off.
+// fetchWithRetry attempts up to cfg.Retries fetches with exponential back-off.
 // It surfaces non-2xx HTTP status codes as errors and respects context
 // cancellation between attempts.
 func (r *Runner) fetchWithRetry(ctx context.Context, pageURL string, pagesCompleted *int32) (*http.Response, error) {
 	var lastErr error
+	maxRetries := r.cfg.Retries
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Check context before every attempt.
@@ -395,8 +443,8 @@ func (r *Runner) fetchWithRetry(ctx context.Context, pageURL string, pagesComple
 			// 429 (rate limited) and 5xx are transient: long back-off then retry.
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				backoff := time.Duration(attempt*attempt) * time.Second // 1s, 4s, 9s
-				r.logStatus(fmt.Sprintf("⚠ HTTP %d on page fetch; backing off %s (attempt %d/%d)",
-					resp.StatusCode, backoff, attempt, maxRetries), colorYellow)
+				r.notify(levelWarn, "HTTP %d on page fetch; backing off %s (attempt %d/%d)",
+					resp.StatusCode, backoff, attempt, maxRetries)
 				if !sleepCtx(ctx, backoff) {
 					return nil, ctx.Err()
 				}
@@ -410,8 +458,8 @@ func (r *Runner) fetchWithRetry(ctx context.Context, pageURL string, pagesComple
 
 		if attempt < maxRetries {
 			backoff := time.Duration(attempt) * time.Second
-			r.logStatus(fmt.Sprintf("⚠ retrying page fetch (attempt %d/%d): %v",
-				attempt, maxRetries, lastErr), colorYellow)
+			r.notify(levelWarn, "retrying page fetch (attempt %d/%d): %v",
+				attempt, maxRetries, lastErr)
 			if pagesCompleted != nil && r.pbar != nil {
 				r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 			}
@@ -594,6 +642,7 @@ func (r *Runner) printJSON(bufw *bufio.Writer, resultsCh <-chan string, pagesCom
 		r.pbar.ClearLine()
 		enc.Encode(rec) // Encode appends a newline, giving JSONL output
 		bufw.Flush()    // stream each record live rather than buffering
+		atomic.AddInt64(&r.found, 1)
 		r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 	}
 	r.finishOutput(bufw)
@@ -671,25 +720,27 @@ func (r *Runner) writeWithProgress(bufw *bufio.Writer, value string, pagesComple
 	// sitting in the buffer until it fills or the run ends. A persistent write
 	// error is surfaced once by finishOutput; a per-line error is ignored here.
 	bufw.Flush()
+	atomic.AddInt64(&r.found, 1)
 	r.pbar.Render(int(atomic.LoadInt32(pagesCompleted)))
 }
 
 // finishOutput flushes the per-domain buffered writer. The underlying file is
 // left open so subsequent domains can keep appending; it is closed once by
 // closeOutput after the whole run completes. A flush error (e.g. disk full or a
-// closed pipe) is surfaced to stderr rather than silently dropped.
+// closed pipe) is surfaced rather than silently dropped.
 func (r *Runner) finishOutput(bufw *bufio.Writer) {
 	if err := bufw.Flush(); err != nil {
-		fmt.Fprintln(os.Stderr, "⚠ WARNING: error writing output:", err)
+		r.log.warn("error writing output: %v", err)
 	}
 }
 
 // closeOutput closes the output file once, at the end of the run, and reports
-// where results were saved. Safe to call when no output file is configured.
+// where results were saved (to stderr, so stdout stays a clean result stream).
+// Safe to call when no output file is configured.
 func (r *Runner) closeOutput() {
 	if r.outFile != nil {
 		r.outFile.Close()
 		r.outFile = nil
-		fmt.Fprintln(os.Stdout, "✔ Saved results to", r.cfg.OutputFile)
+		r.log.info("saved results to %s", r.cfg.OutputFile)
 	}
 }

@@ -72,7 +72,7 @@ func main() {
 	defer stop()
 
 	if err := runner.Run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "❌ ERROR:", err)
+		// Run already reported the failure(s) via its logger; just set the code.
 		os.Exit(1)
 	}
 }

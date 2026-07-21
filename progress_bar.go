@@ -48,20 +48,24 @@ type PBar struct {
 	colorStderr bool // stderr is a terminal and color is enabled
 }
 
-func NewPBar(total int) *PBar {
-	noColor := os.Getenv("NO_COLOR") != ""
+// NewPBar builds a progress bar. enabled=false disables rendering entirely
+// (e.g. --silent or --stats); color controls ANSI output. The caller decides
+// both, having already accounted for NO_COLOR, --nc, and terminal detection.
+func NewPBar(total int, enabled, color bool) *PBar {
 	p := &PBar{
 		Total:       total,
 		Width:       40,
 		DoneStr:     "#",
 		OngoingStr:  ".",
 		start:       time.Now(),
-		noColor:     noColor,
-		colorStderr: !noColor && isTerminal(os.Stderr.Fd()),
+		noColor:     !color,
+		colorStderr: color && isTerminal(os.Stderr.Fd()),
 	}
-	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
-		p.out = tty
-		fmt.Fprint(p.out, ansiHideCur) // hidden until Finish restores it
+	if enabled {
+		if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+			p.out = tty
+			fmt.Fprint(p.out, ansiHideCur) // hidden until Finish restores it
+		}
 	}
 	return p
 }
@@ -163,6 +167,13 @@ func (p *PBar) columns() int {
 		}
 	}
 	return 80
+}
+
+// active reports whether the bar is rendering (a TTY was acquired).
+func (p *PBar) active() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.out != nil
 }
 
 // ClearLine erases the current progress line so other output can be printed.

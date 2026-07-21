@@ -60,6 +60,9 @@ func newPipelineRunner(t *testing.T, srv *httptest.Server, cfg *Config, out *byt
 	if cfg.URLPattern == "" {
 		cfg.URLPattern = "example.com"
 	}
+	if cfg.Retries == 0 {
+		cfg.Retries = 3
+	}
 	re, includeMode, err := CompileExtRegex(cfg.IncludeExt, cfg.EffectiveExclude())
 	if err != nil {
 		t.Fatalf("CompileExtRegex: %v", err)
@@ -68,6 +71,7 @@ func newPipelineRunner(t *testing.T, srv *httptest.Server, cfg *Config, out *byt
 		cfg:            cfg,
 		client:         srv.Client(),
 		baseURL:        srv.URL,
+		log:            newLogger(cfg.Silent, false),
 		extRegex:       re,
 		includeMode:    includeMode,
 		currentPattern: cfg.URLPattern,

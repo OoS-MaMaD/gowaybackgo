@@ -27,7 +27,7 @@ func TestEffectiveExclude(t *testing.T) {
 func TestValidateNumericFlags(t *testing.T) {
 	// A baseline of valid numeric values; each case overrides one field.
 	base := func() Config {
-		return Config{Workers: 20, PageWorkers: 10, Timeout: 80 * 1e9, RateLimit: 0}
+		return Config{Workers: 20, PageWorkers: 10, Timeout: 80 * 1e9, RateLimit: 0, Retries: 3}
 	}
 	tests := []struct {
 		name    string
@@ -59,7 +59,7 @@ func TestValidateNumericFlags(t *testing.T) {
 func TestValidateExclusiveModes(t *testing.T) {
 	// Start from valid numeric fields so only the mode logic is under test.
 	base := func() Config {
-		return Config{Workers: 20, PageWorkers: 10, Timeout: 80 * 1e9}
+		return Config{Workers: 20, PageWorkers: 10, Timeout: 80 * 1e9, Retries: 3}
 	}
 	tests := []struct {
 		name    string

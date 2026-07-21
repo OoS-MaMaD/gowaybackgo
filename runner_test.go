@@ -243,7 +243,7 @@ func TestFetchWithRetry(t *testing.T) {
 			fmt.Fprintln(w, "ok")
 		}))
 		defer srv.Close()
-		r := &Runner{client: srv.Client()}
+		r := &Runner{client: srv.Client(), cfg: &Config{Retries: 3}, log: newLogger(false, false)}
 		resp, err := r.fetchWithRetry(context.Background(), srv.URL, nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -261,7 +261,7 @@ func TestFetchWithRetry(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		}))
 		defer srv.Close()
-		r := &Runner{client: srv.Client()}
+		r := &Runner{client: srv.Client(), cfg: &Config{Retries: 3}, log: newLogger(false, false)}
 		if _, err := r.fetchWithRetry(context.Background(), srv.URL, nil); err == nil {
 			t.Fatal("expected an error for HTTP 404")
 		}
@@ -273,7 +273,7 @@ func TestFetchWithRetry(t *testing.T) {
 	t.Run("already-cancelled context returns immediately", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		r := &Runner{client: http.DefaultClient}
+		r := &Runner{client: http.DefaultClient, cfg: &Config{Retries: 3}, log: newLogger(false, false)}
 		if _, err := r.fetchWithRetry(ctx, "http://example.invalid", nil); err == nil {
 			t.Fatal("expected an error on a cancelled context")
 		}
